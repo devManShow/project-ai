@@ -182,3 +182,5 @@ alertcondition(swingL, "Swing low confirmed", "{{ticker}} {{interval}}: swing LO
 alertcondition(swingH, "Swing high confirmed", "{{ticker}} {{interval}}: swing HIGH confirmed, leg turned DOWN. Close {{close}}")
 alertcondition(trendUp, "Structure turned UP", "{{ticker}} {{interval}}: close broke above the last swing high, structure UP. Close {{close}}")
 alertcondition(trendDn, "Structure turned DOWN", "{{ticker}} {{interval}}: close broke below the last swing low, structure DOWN. Close {{close}}")
+
+// ───────────────────────────── End of script. If this line is missing in the Pine Editor, the paste was cut off.
