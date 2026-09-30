@@ -1,0 +1,184 @@
+//@version=6
+//
+// Gold Swing Structure (GSS)
+// Volatility-adaptive swing and trend detector, tuned on XAUUSD 1m (works on any symbol / timeframe).
+//
+// Why it skips the fakes: a high or low only counts as a swing once price has come back from it by
+// "Reversal x ATR", measured on candle closes. The small wiggles that fractals / pivot indicators mark
+// never travel that far, and a wick that pokes through on a news spike does not count unless a candle
+// closes there. The ATR makes the threshold follow gold's volatility (quiet Asia vs. London/NY).
+//
+// What it cannot do: know a swing is real at the moment it prints. Every label is drawn back on the
+// extreme bar, but it only appears once confirmed; the small triangle marks the bar where that happened.
+// Confirmed swings never move or disappear afterwards. The dashed line is the developing, unconfirmed leg.
+//
+// The same logic is ported to Python in reference/swing_detector.py for offline testing.
+indicator("Gold Swing Structure", shorttitle = "GSS", overlay = true, max_labels_count = 500, max_lines_count = 500, max_bars_back = 5000)
+
+// ───────────────────────────── Inputs
+string G_SW = "Swing detection"
+int   atrLen   = input.int(100, "ATR length", minval = 1, group = G_SW, tooltip = "Volatility unit. 100 bars on 1m is the last ~1.5 hours, so the threshold shrinks in quiet sessions and grows in London / New York.")
+float revMult  = input.float(6.0, "Reversal (x ATR)", minval = 0.5, step = 0.5, group = G_SW, tooltip = "How far price must come back from a high / low before it counts as a swing. Higher = fewer, bigger swings and later confirmation. 5-7 suits XAUUSD 1m; lower it to 4 to also catch small pullbacks.")
+float minRev   = input.float(0.0, "Minimum reversal (price)", minval = 0.0, step = 0.5, group = G_SW, tooltip = "Absolute floor for the reversal in price units, e.g. 3 = $3 on XAUUSD. 0 = off.")
+bool  useClose = input.bool(true, "Confirm on candle close (ignore wicks)", group = G_SW, tooltip = "On: a wick past the threshold is not enough, a candle must close there. Filters news-spike fakes for a little extra lag.")
+
+string G_VIS = "Display"
+bool  showZig    = input.bool(true, "Zigzag", group = G_VIS)
+bool  showLabels = input.bool(true, "Swing labels (HH / HL / LH / LL)", group = G_VIS)
+bool  showPrice  = input.bool(false, "Price on labels", group = G_VIS)
+bool  showConf   = input.bool(true, "Mark confirmation bars", group = G_VIS, tooltip = "Triangle on the bar where each swing became known. That bar, not the label, is when you could have acted.")
+bool  showLive   = input.bool(true, "Developing leg + confirmation level", group = G_VIS)
+string bgMode   = input.string("Swing leg", "Trend background", options = ["Swing leg", "Market structure", "Off"], group = G_VIS, tooltip = "Swing leg: flips at every confirmed swing (up after a swing low, down after a swing high).\nMarket structure: slower, flips only when a candle closes beyond the last confirmed swing high / low.")
+bool  showTable  = input.bool(true, "Status table", group = G_VIS)
+color upCol      = input.color(#26a69a, "Bullish", group = G_VIS, inline = "col")
+color dnCol      = input.color(#ef5350, "Bearish", group = G_VIS, inline = "col")
+color zigCol     = input.color(#42a5f5, "Zigzag", group = G_VIS, inline = "col")
+
+// ───────────────────────────── Swing engine
+float atr   = ta.atr(atrLen)
+float thr   = math.max(revMult * atr, minRev)
+float dnSrc = useClose ? close : low
+float upSrc = useClose ? close : high
+
+var int    dir       = 0     // +1 up-leg (hunting a high), -1 down-leg (hunting a low), 0 before the first swing
+var float  ext       = na    // extreme of the current leg
+var int    extBar    = na
+var float  hi        = na    // running high / low, only used before the first swing
+var int    hiBar     = na
+var float  lo        = na
+var int    loBar     = na
+var float  lastH     = na    // last confirmed swing high / low prices
+var float  lastL     = na
+var int    lastBar   = na    // last confirmed swing of either kind
+var float  lastPrice = na
+var string lastLabel = ""
+var int    trend     = 0     // +1 / -1 once a close breaks the last swing high / low
+
+bool   swingH = false
+bool   swingL = false
+int    sBar   = na
+float  sPrice = na
+string sKind  = na
+int    prevTrend = trend
+
+// Closed bars only, so a swing can never appear and vanish again inside a live candle.
+if barstate.isconfirmed and not na(thr)
+    if dir == 0
+        if na(hi) or high > hi
+            hi    := high
+            hiBar := bar_index
+        if na(lo) or low < lo
+            lo    := low
+            loBar := bar_index
+        if hi - dnSrc >= thr
+            swingH := true
+            sBar   := hiBar
+            sPrice := hi
+        else if upSrc - lo >= thr
+            swingL := true
+            sBar   := loBar
+            sPrice := lo
+    else if dir == 1
+        if high > ext
+            ext    := high
+            extBar := bar_index
+        if ext - dnSrc >= thr
+            swingH := true
+            sBar   := extBar
+            sPrice := ext
+    else
+        if low < ext
+            ext    := low
+            extBar := bar_index
+        if upSrc - ext >= thr
+            swingL := true
+            sBar   := extBar
+            sPrice := ext
+
+    // The new leg starts from the most extreme bar after the swing (the oldest one on ties).
+    if swingH
+        dir    := -1
+        ext    := low
+        extBar := bar_index
+        int n = math.min(bar_index - sBar - 1, 4999)
+        if n > 0
+            for k = 1 to n
+                if low[k] <= ext
+                    ext    := low[k]
+                    extBar := bar_index - k
+    if swingL
+        dir    := 1
+        ext    := high
+        extBar := bar_index
+        int n = math.min(bar_index - sBar - 1, 4999)
+        if n > 0
+            for k = 1 to n
+                if high[k] >= ext
+                    ext    := high[k]
+                    extBar := bar_index - k
+
+    if swingH
+        sKind := na(lastH) ? "H" : sPrice > lastH ? "HH" : "LH"
+        lastH := sPrice
+    if swingL
+        sKind := na(lastL) ? "L" : sPrice > lastL ? "HL" : "LL"
+        lastL := sPrice
+
+    // Structure trend: flips only when a candle closes beyond the last confirmed swing.
+    if not na(lastH) and close > lastH
+        trend := 1
+    else if not na(lastL) and close < lastL
+        trend := -1
+
+// ───────────────────────────── Drawing
+if swingH or swingL
+    if showZig and not na(lastBar)
+        line.new(lastBar, lastPrice, sBar, sPrice, color = zigCol, width = 2)
+    if showLabels
+        string txt = showPrice ? sKind + "\n" + str.tostring(sPrice, format.mintick) : sKind
+        string tip = (swingH ? "Swing high " : "Swing low ") + sKind + " at " + str.tostring(sPrice, format.mintick) + "\nConfirmed " + str.tostring(bar_index - sBar) + " bars later, close " + str.tostring(close, format.mintick) + "\nReversal required: " + str.tostring(thr, format.mintick)
+        label.new(sBar, sPrice, txt, color = swingH ? dnCol : upCol, textcolor = color.white, style = swingH ? label.style_label_down : label.style_label_up, size = size.small, tooltip = tip)
+    lastBar   := sBar
+    lastPrice := sPrice
+    lastLabel := sKind
+
+bool trendUp = trend == 1 and prevTrend != 1
+bool trendDn = trend == -1 and prevTrend != -1
+
+int bgDir = bgMode == "Swing leg" ? dir : bgMode == "Market structure" ? trend : 0
+bgcolor(bgDir == 1 ? color.new(upCol, 90) : bgDir == -1 ? color.new(dnCol, 90) : na, title = "Trend background")
+plotshape(showConf and swingL, "Swing low confirmed", shape.triangleup, location.belowbar, upCol, size = size.tiny)
+plotshape(showConf and swingH, "Swing high confirmed", shape.triangledown, location.abovebar, dnCol, size = size.tiny)
+
+// Developing leg: from the last swing to the current extreme, plus the close that would confirm it.
+var line  liveLine = na
+var line  confLine = na
+var label confLbl  = na
+if barstate.islast and showLive and dir != 0 and not na(lastBar) and not na(thr)
+    float  lvl  = dir == 1 ? ext - thr : ext + thr
+    string what = (dir == 1 ? "Swing high confirms " + (useClose ? "on a close" : "at") + " ≤ " : "Swing low confirms " + (useClose ? "on a close" : "at") + " ≥ ") + str.tostring(lvl, format.mintick)
+    line.delete(liveLine)
+    line.delete(confLine)
+    label.delete(confLbl)
+    liveLine := line.new(lastBar, lastPrice, extBar, ext, color = zigCol, style = line.style_dashed, width = 1)
+    confLine := line.new(extBar, lvl, bar_index + 8, lvl, color = color.gray, style = line.style_dotted, width = 1)
+    confLbl  := label.new(bar_index + 8, lvl, what, color = color(na), textcolor = color.gray, style = label.style_label_left, size = size.small)
+
+// ───────────────────────────── Status table
+var table tbl = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 25), border_width = 1)
+if barstate.islast and showTable
+    color tc = color.white
+    table.cell(tbl, 0, 0, "Swing leg", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, dir == 1 ? "UP, next swing is a high" : dir == -1 ? "DOWN, next swing is a low" : "-", text_color = dir == 1 ? upCol : dir == -1 ? dnCol : tc, text_size = size.small)
+    table.cell(tbl, 0, 1, "Structure", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 1, trend == 1 ? "UP" : trend == -1 ? "DOWN" : "-", text_color = trend == 1 ? upCol : trend == -1 ? dnCol : tc, text_size = size.small)
+    table.cell(tbl, 0, 2, "Last swing", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 2, na(lastBar) ? "-" : lastLabel + " @ " + str.tostring(lastPrice, format.mintick), text_color = tc, text_size = size.small)
+    table.cell(tbl, 0, 3, "Reversal needed", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(thr, format.mintick) + " (" + str.tostring(revMult) + " x ATR)", text_color = tc, text_size = size.small)
+
+// ───────────────────────────── Alerts (create them with "Once Per Bar Close")
+alertcondition(swingL, "Swing low confirmed", "{{ticker}} {{interval}}: swing LOW confirmed, leg turned UP. Close {{close}}")
+alertcondition(swingH, "Swing high confirmed", "{{ticker}} {{interval}}: swing HIGH confirmed, leg turned DOWN. Close {{close}}")
+alertcondition(trendUp, "Structure turned UP", "{{ticker}} {{interval}}: close broke above the last swing high, structure UP. Close {{close}}")
+alertcondition(trendDn, "Structure turned DOWN", "{{ticker}} {{interval}}: close broke below the last swing low, structure DOWN. Close {{close}}")
