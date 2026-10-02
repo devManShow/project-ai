@@ -1,179 +1,201 @@
 //@version=5
-// Indicator: AhmadZ Algo Signals & Overlays [Institutional Precision Scalper v3]
-indicator("AhmadZ Algo Signals & Overlays [Institutional Precision v3]", "AhmadZ Scalper Clean", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+// Indicator: AhmadZ Algo Signals & Overlays [Institutional Precision Scalper v4]
+//
+// v4 signal engine:
+//  - Trigger = confirmed flip of an ATR trailing-stop trend state (one signal per trend leg),
+//    instead of a band crossover that re-fired repeatedly inside the same move.
+//  - Late-confirmation window: a flip that fails a filter may still confirm a few bars later.
+//  - Regime filter (ADX + Choppiness Index) and consolidation box block sideways-market signals.
+//  - Non-repainting higher-timeframe bias (last closed HTF bar only).
+//  - Coherent 0-5 confluence score: Local Trend, HTF Bias, Momentum, Volume Flow, Location.
+//  - Optional trend-continuation re-entries after a pullback to the fast EMA.
+//  - Hybrid ATR/swing stops, conservative same-bar SL/TP resolution, outcome stats in the HUD.
+indicator("AhmadZ Algo Signals & Overlays [Institutional Precision v4]", "AhmadZ Scalper Clean", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 // # ============================[INPUT CONTROLS]============================ #
 groupBasic = "BASIC SETTINGS & PRESETS"
-showSignals         = input.bool(true, "Show Signals", inline = "1", group = groupBasic)
-signalMode          = input.string("Scalper [Responsive]", "Execution Engine", ["Scalper [Responsive]", "Swing [Conservative]", "Raw Momentum"], group = groupBasic)
-sensitivity         = input.float(1.0, "Signal Sensitivity", minval = 0.5, maxval = 15.0, step = 0.1, group = groupBasic)
-atrLength           = input.int(7, "Signal ATR Period", minval = 1, maxval = 25, step = 1, group = groupBasic)
-waitBarClose        = input.bool(true, "Wait for Bar Close (Anti-Repaint)", group = groupBasic)
-filterRepeatSignals = input.bool(true, "Filter Consecutive Same-Side Signals", group = groupBasic)
-candleColorType     = input.string("Confirmation Simple", "Candle Coloring", ["Confirmation Simple", "Confirmation Gradient", "None"], group = groupBasic)
+showSignals       = input.bool(true, "Show Signals", group = groupBasic)
+signalMode        = input.string("Scalper [Responsive]", "Execution Engine", ["Scalper [Responsive]", "Swing [Conservative]", "Raw Momentum"], group = groupBasic, tooltip = "Scalper: trend flips graded by the confluence score, blocked in chop.\nSwing: Scalper rules + local and HTF trend must agree with the signal.\nRaw Momentum: every confirmed trend flip, no filters (diagnostics).")
+sensitivity       = input.float(1.0, "Signal Sensitivity (ATR Factor)", minval = 0.5, maxval = 15.0, step = 0.1, group = groupBasic, tooltip = "Width of the ATR trailing band. Lower = earlier / more flips, higher = later / fewer flips.")
+atrLength         = input.int(7, "Signal ATR Period", minval = 1, maxval = 50, step = 1, group = groupBasic)
+waitBarClose      = input.bool(true, "Wait for Bar Close (Anti-Repaint)", group = groupBasic)
+allowContinuation = input.bool(true, "Allow Trend Continuation Re-entries", group = groupBasic, tooltip = "Inside an established trend leg, allow a new same-side signal once no same-side trade is open and price has pulled back to the fast EMA and resumed. Shown as C + score.")
+confirmWindow     = input.int(3, "Late Confirmation Window (Bars)", minval = 0, maxval = 10, group = groupBasic, tooltip = "If the flip bar fails a filter, the signal may still fire within this many bars while the trend leg is intact. 0 = flip bar only.")
+candleColorType   = input.string("Confirmation Simple", "Candle Coloring", ["Confirmation Simple", "Confirmation Gradient", "None"], group = groupBasic)
 
 groupChop = "CHOP & NOISE ELIMINATOR (PRO)"
-minSignalScore      = input.int(4, "Minimum Score to Display (1-5)", minval = 1, maxval = 5, tooltip = "Set to 4 to eliminate sideways noise and only trade high-probability setups.", group = groupChop)
+minSignalScore      = input.int(4, "Minimum Score to Display (1-5)", minval = 1, maxval = 5, group = groupChop, tooltip = "Score = Local Trend + HTF Bias + Momentum + Volume Flow + Location (1 point each). A disabled filter counts as passed.")
+useRegimeFilter     = input.bool(true, "Block Signals in Choppy Regime", group = groupChop, tooltip = "Choppy = ADX below the minimum AND Choppiness Index above the maximum.")
+regimeLength        = input.int(14, "Regime Length", minval = 5, maxval = 50, group = groupChop)
+adxThreshold        = input.float(20.0, "Min ADX", minval = 5.0, maxval = 50.0, step = 1.0, inline = "rg", group = groupChop)
+chopThreshold       = input.float(58.0, "Max Choppiness", minval = 40.0, maxval = 80.0, step = 0.5, inline = "rg", group = groupChop)
 filterConsolidation = input.bool(true, "Block Signals Inside Tight Consolidation Boxes", tooltip = "Suppresses signals when range is too tight for profitable scalping.", group = groupChop)
-minBarsBetweenSides = input.int(4, "Cooldown (Bars between Opposite Signals)", minval = 0, maxval = 20, group = groupChop)
-showDimmedWeak      = input.bool(false, "Show Dimmed Dots for Filtered Signals", group = groupChop)
+consolidationMult   = input.float(3.2, "Consolidation Box Size (ATR)", minval = 1.0, maxval = 10.0, step = 0.1, group = groupChop, tooltip = "A 20-bar range smaller than this many signal ATRs counts as a tight box.")
+minBarsBetweenSides = input.int(4, "Cooldown (Bars between Signals)", minval = 0, maxval = 20, group = groupChop)
+showDimmedWeak      = input.bool(false, "Show Dimmed Dots for Filtered Signals", group = groupChop, tooltip = "Hover a dot to see why that trend flip was rejected.")
 
 groupStructure = "MARKET CONTEXT & STRUCTURE"
-rangeLookback       = input.int(70, "Macro Dealing Range Lookback (Bars)", minval = 30, maxval = 200, tooltip = "70 bars covers ~3.5 hours, identifying true Session Extremes.", group = groupStructure)
-swingLookback       = input.int(20, "Major Swing High/Low Lookback", minval = 10, maxval = 50, group = groupStructure)
+rangeLookback = input.int(70, "Macro Dealing Range Lookback (Bars)", minval = 30, maxval = 200, tooltip = "70 bars covers ~3.5 hours, identifying true Session Extremes.", group = groupStructure)
+swingLookback = input.int(20, "Major Swing High/Low Lookback", minval = 10, maxval = 50, tooltip = "Also the window in which a liquidity sweep of that swing counts toward the Location point.", group = groupStructure)
+maxExtension  = input.float(2.0, "Max Distance from Fast EMA (ATR)", minval = 0.5, maxval = 6.0, step = 0.1, group = groupStructure, tooltip = "Entries further than this from the fast EMA are treated as chasing and lose the Location point.")
 
-groupTrend = "LOCAL TREND FILTER (NO LAG)"
+groupTrend = "TREND FILTERS (NO REPAINT)"
 useLocalTrendFilter = input.bool(true, "Enable Dynamic Fast Trend Filter", group = groupTrend)
-localFastLen        = input.int(21, "Fast Trend EMA", group = groupTrend)
-localSlowLen        = input.int(55, "Slow Trend EMA", group = groupTrend)
+localFastLen        = input.int(21, "Fast Trend EMA", minval = 2, group = groupTrend)
+localSlowLen        = input.int(55, "Slow Trend EMA", minval = 3, group = groupTrend)
+useHtfFilter        = input.bool(true, "Enable Higher-Timeframe Bias", group = groupTrend, tooltip = "Uses the last CLOSED higher-timeframe bar, so it never repaints. Ignored when the chart timeframe is equal or higher.")
+htfTimeframe        = input.timeframe("15", "HTF", inline = "htf", group = groupTrend)
+htfEmaLen           = input.int(50, "EMA", minval = 2, inline = "htf", group = groupTrend)
+
+groupSession = "SESSION FILTER"
+useSession    = input.bool(false, "Only Signal Inside Session", group = groupSession)
+sessionWindow = input.session("0300-1200", "Session", inline = "ses", group = groupSession)
+sessionTz     = input.string("America/New_York", "Timezone", inline = "ses", group = groupSession)
 
 groupOverlay = "OVERLAYS & VISUALS"
-showSmartTrail      = input.bool(true, "Show Adaptive Ribbon", inline = "1", group = groupOverlay)
-showDashboard       = input.bool(true, "Show HUD Dashboard", inline = "2", group = groupOverlay)
-dashboardLocation   = input.string("Bottom Right", "Location", ["Top Right", "Bottom Right", "Bottom Left"], inline = "3", group = groupOverlay)
-dashboardSize       = input.string("Normal", "Size", ["Tiny", "Small", "Normal", "Large"], inline = "3", group = groupOverlay)
+showSmartTrail    = input.bool(true, "Show Adaptive Ribbon", inline = "1", group = groupOverlay)
+showDashboard     = input.bool(true, "Show HUD Dashboard", inline = "2", group = groupOverlay)
+dashboardLocation = input.string("Bottom Right", "Location", ["Top Right", "Bottom Right", "Bottom Left"], inline = "3", group = groupOverlay)
+dashboardSize     = input.string("Normal", "Size", ["Tiny", "Small", "Normal", "Large"], inline = "3", group = groupOverlay)
 
 groupExecution = "RISK MANAGEMENT & TRADE LEVELS"
-showTradeLevels     = input.bool(true, "Show Active Trade Projections", inline = "1", group = groupExecution)
-autoBreakEven       = input.bool(true, "Auto Break-Even at TP1", inline = "2", group = groupExecution)
-rrMultiplierSL      = input.float(1.5, "ATR SL Multiplier", step = 0.1, inline = "3", group = groupExecution)
-rrRatioTP1          = input.float(1.5, "TP1 Risk-Reward", step = 0.5, inline = "4", group = groupExecution)
-rrRatioTP2          = input.float(2.5, "TP2 Risk-Reward", step = 0.5, inline = "4", group = groupExecution)
+showTradeLevels = input.bool(true, "Show Active Trade Projections", inline = "1", group = groupExecution)
+showOutcomes    = input.bool(true, "Mark Trade Outcomes", inline = "1", group = groupExecution)
+autoBreakEven   = input.bool(true, "Auto Break-Even at TP1", inline = "2", group = groupExecution)
+stopMethod      = input.string("Hybrid (ATR + Swing)", "Stop Placement", ["ATR", "Hybrid (ATR + Swing)"], group = groupExecution, tooltip = "Hybrid moves the stop beyond the recent swing when that is further than the ATR stop, capped at Max Stop.")
+stopSwingLen    = input.int(10, "Swing Stop Lookback", minval = 2, maxval = 50, group = groupExecution)
+rrMultiplierSL  = input.float(1.5, "ATR SL Multiplier", minval = 0.1, step = 0.1, inline = "3", group = groupExecution)
+maxStopAtr      = input.float(3.0, "Max Stop (ATR)", minval = 0.5, step = 0.1, inline = "3", group = groupExecution)
+rrRatioTP1      = input.float(1.5, "TP1 Risk-Reward", step = 0.5, inline = "4", group = groupExecution)
+rrRatioTP2      = input.float(2.5, "TP2 Risk-Reward", step = 0.5, inline = "4", group = groupExecution)
+tp1ClosePct     = input.float(50.0, "TP1 Partial Close % (stats only)", minval = 0.0, maxval = 100.0, step = 5.0, group = groupExecution, tooltip = "Share of the position assumed closed at TP1 when computing the R statistics in the HUD.")
 
 // # ============================[GLOBAL ENGINE VARIABLES]============================ #
-n = bar_index
-atrVal = ta.atr(atrLength)
-atr14  = ta.atr(14)
-atr30  = ta.atr(30)
+n              = bar_index
+atrVal         = ta.atr(atrLength)
+atrRisk        = ta.atr(14)
+isRaw          = signalMode == "Raw Momentum"
+isSwing        = signalMode == "Swing [Conservative]"
+executionReady = not waitBarClose or barstate.isconfirmed
+warmedUp       = n > math.max(localSlowLen, rangeLookback, 30)
 
-// Fast Local EMAs
-emaFast = ta.ema(close, localFastLen)
-emaSlow = ta.ema(close, localSlowLen)
-localBull = useLocalTrendFilter ? (close > emaFast and emaFast >= emaSlow) : true
-localBear = useLocalTrendFilter ? (close < emaFast and emaFast <= emaSlow) : true
+// Fast Local EMAs (raw state is used for display; the filter toggles only change gating)
+emaFast     = ta.ema(close, localFastLen)
+emaSlow     = ta.ema(close, localSlowLen)
+localBull   = close > emaFast and emaFast > emaSlow
+localBear   = close < emaFast and emaFast < emaSlow
+localTurnUp = close > emaFast and emaFast > emaFast[1]
+localTurnDn = close < emaFast and emaFast < emaFast[1]
+
+// Higher-timeframe bias: [1] + lookahead_on = last closed HTF bar, no repainting
+htfActive = useHtfFilter and timeframe.in_seconds(htfTimeframe) > timeframe.in_seconds(timeframe.period)
+htfTf     = htfActive ? htfTimeframe : timeframe.period
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfEmaLen)[1]], lookahead = barmerge.lookahead_on)
+htfBull = htfClose > htfEma
+htfBear = htfClose < htfEma
+
+// Session
+inSession = not useSession or not na(time(timeframe.period, sessionWindow, sessionTz))
 
 // # ============================[ADAPTIVE MOMENTUM ENGINE]============================ #
-var float upper = hl2
-var float lower = hl2
-var int os = 0
+// ATR trailing-stop trend state. direction < 0 = bullish leg, > 0 = bearish leg.
+[stLine, stDir] = ta.supertrend(sensitivity, atrLength)
+trendUp = stDir < 0
+trendDn = stDir > 0
+flipUp  = trendUp and stDir[1] > 0
+flipDn  = trendDn and stDir[1] < 0
 
-mult = sensitivity
-up_super = hl2 + atrVal * mult
-dn_super = hl2 - atrVal * mult
-
-upper := close[1] < upper ? math.min(up_super, upper) : up_super
-lower := close[1] > lower ? math.max(dn_super, lower) : dn_super
-os := close > upper ? 1 : close < lower ? 0 : os
-
-// Native Trailing Ribbon
-ribbonBase = ta.ema(close, 9)
-ribbonUp   = ribbonBase + atrVal * 1.2
-ribbonDn   = ribbonBase - atrVal * 1.2
-ribbonDir  = close > ribbonBase ? 1 : -1
-
-p1 = plot(showSmartTrail ? (ribbonDir == 1 ? ribbonDn : ribbonUp) : na, "Ribbon Band", color = ribbonDir == 1 ? color.new(#2962ff, 40) : color.new(#f23645, 40), editable = false)
-p2 = plot(showSmartTrail ? ribbonBase : na, "Ribbon Mid", color = color.new(color.white, 100), editable = false)
-fill(p1, p2, color = ribbonDir == 1 ? color.new(#2962ff, 92) : color.new(#f23645, 92))
+// Adaptive Ribbon = the trailing stop that defines the signal, so ribbon, candles and signals always agree
+pMid = plot(showSmartTrail ? hl2 : na, "Ribbon Mid", color = color.new(color.white, 100), editable = false)
+pUp  = plot(showSmartTrail and trendUp ? stLine : na, "Trail (Bull)", color = color.new(#2962ff, 40), style = plot.style_linebr)
+pDn  = plot(showSmartTrail and trendDn ? stLine : na, "Trail (Bear)", color = color.new(#f23645, 40), style = plot.style_linebr)
+fill(pMid, pUp, color = color.new(#2962ff, 92))
+fill(pMid, pDn, color = color.new(#f23645, 92))
 
 // # ============================[VOLUME & MOMENTUM CONTEXT]============================ #
-barRange = high - low
-bullVolumeRatio = barRange > 0 ? (close - low) / barRange : 0.5
-buyVol  = volume * bullVolumeRatio
-sellVol = volume * (1.0 - bullVolumeRatio)
-volFlow = ta.ema(buyVol - sellVol, 9)
-volumeBull = volFlow > 0
-volumeBear = volFlow < 0
+barRange   = high - low
+closeLoc   = barRange > 0 ? (close - low) / barRange : 0.5
+vol        = nz(volume)
+hasVolume  = ta.cum(vol) > 0
+volFlow    = ta.ema(vol * (2.0 * closeLoc - 1.0), 9)
+volAvg     = ta.sma(vol, 20)
+relVol     = volAvg > 0 ? vol / volAvg : 1.0
+// No volume feed -> the factor is neutral (passes) instead of silently failing
+volumeBull = hasVolume ? (volFlow > 0 and relVol >= 0.8) : true
+volumeBear = hasVolume ? (volFlow < 0 and relVol >= 0.8) : true
 
+// Histogram must actually be building in the signal direction (v3 used "or", which was true ~75% of bars)
 [macdLine, signalLine, histLine] = ta.macd(close, 8, 21, 5)
-momentumBull = histLine > 0 or histLine > histLine[1]
-momentumBear = histLine < 0 or histLine < histLine[1]
+momentumBull = histLine > histLine[1] and (histLine > 0 or histLine[1] > histLine[2])
+momentumBear = histLine < histLine[1] and (histLine < 0 or histLine[1] < histLine[2])
 
 // # ============================[STRUCTURE & CONSOLIDATION ENGINES]============================ #
-// 1. Extended Dealing Range (Filters out mid-range oscillations)
-rangeH = ta.highest(high, rangeLookback)
-rangeL = ta.lowest(low, rangeLookback)
+// 1. Extended Dealing Range
+rangeH    = ta.highest(high, rangeLookback)
+rangeL    = ta.lowest(low, rangeLookback)
 rangeSpan = rangeH - rangeL
-relPos = rangeSpan > 0 ? (close - rangeL) / rangeSpan : 0.5
+relPos    = rangeSpan > 0 ? (close - rangeL) / rangeSpan : 0.5
 
 inTruePremium  = relPos >= 0.60
 inTrueDiscount = relPos <= 0.40
 
-// 2. High-Conviction Rejection / Liquidity Sweep (Major Swings)
-majorHigh = ta.highest(high, swingLookback)[1]
-majorLow  = ta.lowest(low, swingLookback)[1]
+// 2. Liquidity sweep of a major swing (wick through, close back inside)
+majorHigh       = ta.highest(high, swingLookback)[1]
+majorLow        = ta.lowest(low, swingLookback)[1]
+sweptLow        = low < majorLow and close > majorLow
+sweptHigh       = high > majorHigh and close < majorHigh
+recentSweepLow  = nz(ta.barssince(sweptLow), 100000) <= swingLookback
+recentSweepHigh = nz(ta.barssince(sweptHigh), 100000) <= swingLookback
 
-topRejection = (high >= majorHigh) or (barRange > 0 and (high - math.max(open, close)) / barRange >= 0.40)
-bottomRejection = (low <= majorLow) or (barRange > 0 and (math.min(open, close) - low) / barRange >= 0.40)
+// 3. Over-extension (chasing)
+chasingBuy  = close - emaFast > maxExtension * atrRisk
+chasingSell = emaFast - close > maxExtension * atrRisk
 
-// 3. Tight Consolidation Detection (Chop Box)
-boxRange = ta.highest(high, 20) - ta.lowest(low, 20)
-isTightChop = filterConsolidation and (boxRange < atrVal * 3.2)
+// 4. Regime: ADX + Choppiness Index
+[diPlus, diMinus, adxVal] = ta.dmi(regimeLength, regimeLength)
+trSum     = math.sum(ta.tr(true), regimeLength)
+ciSpan    = ta.highest(high, regimeLength) - ta.lowest(low, regimeLength)
+chopIndex = ciSpan > 0 ? 100.0 * math.log10(trSum / ciSpan) / math.log10(regimeLength) : 100.0
+isChoppy  = useRegimeFilter and adxVal < adxThreshold and chopIndex > chopThreshold
 
-// # ============================[CALIBRATED INSTITUTIONAL SCORING]============================ #
-scoreBuy = 1
-if bottomRejection
-    scoreBuy += 1
-if inTrueDiscount
-    scoreBuy += 1
-if volumeBull
-    scoreBuy += 1
-if momentumBull and not isTightChop
-    scoreBuy += 1
+// 5. Tight Consolidation Detection (Chop Box)
+boxRange    = ta.highest(high, 20) - ta.lowest(low, 20)
+isTightChop = filterConsolidation and boxRange < atrVal * consolidationMult
 
-scoreSell = 1
-if topRejection
-    scoreSell += 1
-if inTruePremium
-    scoreSell += 1
-if volumeBear
-    scoreSell += 1
-if momentumBear and not isTightChop
-    scoreSell += 1
+// Pullback tracking for continuation entries & swing stops
+bsTouchFastUp = nz(ta.barssince(low <= emaFast), 100000)
+bsTouchFastDn = nz(ta.barssince(high >= emaFast), 100000)
+swingLowStop  = ta.lowest(low, stopSwingLen)
+swingHighStop = ta.highest(high, stopSwingLen)
 
-// # ============================[CORE TRIGGERS & EXECUTION]============================ #
-executionReady = not waitBarClose or barstate.isconfirmed
+// # ============================[CONFLUENCE SCORING (0-5)]============================ #
+// Every point agrees with the signal direction (v3 mixed breakout triggers with reversal points).
+ptTrendBuy  = not useLocalTrendFilter or localBull or localTurnUp
+ptTrendSell = not useLocalTrendFilter or localBear or localTurnDn
+ptHtfBuy    = not htfActive or htfBull
+ptHtfSell   = not htfActive or htfBear
+ptLocBuy    = not chasingBuy and (relPos <= 0.5 or recentSweepLow)
+ptLocSell   = not chasingSell and (relPos >= 0.5 or recentSweepHigh)
 
-rawBuy  = ta.crossover(close, upper)  and (signalMode != "Swing [Conservative]" or localBull)
-rawSell = ta.crossunder(close, lower) and (signalMode != "Swing [Conservative]" or localBear)
+scoreBuy  = (ptTrendBuy ? 1 : 0) + (ptHtfBuy ? 1 : 0) + (momentumBull ? 1 : 0) + (volumeBull ? 1 : 0) + (ptLocBuy ? 1 : 0)
+scoreSell = (ptTrendSell ? 1 : 0) + (ptHtfSell ? 1 : 0) + (momentumBear ? 1 : 0) + (volumeBear ? 1 : 0) + (ptLocSell ? 1 : 0)
 
-var int lastSignalBar = 0
-var int currentPosition = 0
+// Hard gates
+regimeOk   = not isChoppy and not isTightChop
+alignBuy   = not isSwing or ((not useLocalTrendFilter or localBull) and (not htfActive or htfBull))
+alignSell  = not isSwing or ((not useLocalTrendFilter or localBear) and (not htfActive or htfBear))
+candleBuy  = close > open and closeLoc >= 0.5
+candleSell = close < open and closeLoc <= 0.5
 
-barsSinceLast = n - lastSignalBar
-cooldownPassed = barsSinceLast >= minBarsBetweenSides
-
-isHighQualityBuy  = (scoreBuy >= minSignalScore) and (not isTightChop)
-isHighQualitySell = (scoreSell >= minSignalScore) and (not isTightChop)
-
-triggerBuy  = rawBuy  and executionReady and cooldownPassed and isHighQualityBuy  and (not filterRepeatSignals or currentPosition != 1)
-triggerSell = rawSell and executionReady and cooldownPassed and isHighQualitySell and (not filterRepeatSignals or currentPosition != -1)
-
-dimmedBuy  = rawBuy  and executionReady and showDimmedWeak and not isHighQualityBuy
-dimmedSell = rawSell and executionReady and showDimmedWeak and not isHighQualitySell
-
-if triggerBuy
-    currentPosition := 1
-    lastSignalBar   := n
-if triggerSell
-    currentPosition := -1
-    lastSignalBar   := n
-
-// Candle Coloring
-color candleColor = na
-if candleColorType == "Confirmation Simple"
-    candleColor := os == 1 ? #00897b : #e53935
-else if candleColorType == "Confirmation Gradient"
-    candleColor := os == 1 ? (localBull ? #00e676 : #26a69a) : (localBear ? #ff1744 : #ef5350)
-
-barcolor(candleColorType != "None" ? candleColor : na)
-
-// # ============================[ACTIVE TRADE MANAGEMENT]============================ #
+// # ============================[ACTIVE TRADE STATE]============================ #
 var int   activeDir   = 0
 var float activeEntry = na
 var float activeSL    = na
+var float activeRisk  = na
 var float activeTP1   = na
 var float activeTP2   = na
 var bool  tp1Reached  = false
+var int   entryBar    = na
 
 var line  l_entry = na
 var line  l_sl    = na
@@ -183,6 +205,95 @@ var label lbl_sl  = na
 var label lbl_tp1 = na
 var label lbl_tp2 = na
 
+var int   statTrades = 0
+var int   statWins   = 0
+var int   statTp1    = 0
+var float statNetR   = 0.0
+
+tp1Frac = tp1ClosePct / 100.0
+
+// # ============================[SIGNAL STATE MACHINE]============================ #
+var int   legStartBar   = na
+var bool  legSignaled   = false
+var int   lastSignalBar = na
+var label pendingDot    = na
+
+if flipUp or flipDn
+    legStartBar := n
+    legSignaled := false
+    pendingDot  := na   // a dot left from the previous leg stays on the chart
+
+barsInLeg  = na(legStartBar) ? 100000 : n - legStartBar
+cooldownOk = na(lastSignalBar) or n - lastSignalBar >= minBarsBetweenSides
+
+// First signal of a leg: flip bar or within the late-confirmation window
+windowBuy  = trendUp and barsInLeg <= confirmWindow and not legSignaled
+windowSell = trendDn and barsInLeg <= confirmWindow and not legSignaled
+
+// Continuation: pullback to the fast EMA within 3 bars, then a close beyond the prior bar, no signal since the pullback
+contBuy  = allowContinuation and trendUp and barsInLeg > confirmWindow and activeDir != 1 and bsTouchFastUp <= 3 and close > high[1] and close > emaFast and (na(lastSignalBar) or lastSignalBar < n - bsTouchFastUp)
+contSell = allowContinuation and trendDn and barsInLeg > confirmWindow and activeDir != -1 and bsTouchFastDn <= 3 and close < low[1] and close < emaFast and (na(lastSignalBar) or lastSignalBar < n - bsTouchFastDn)
+
+qualityBuy  = regimeOk and alignBuy and candleBuy and scoreBuy >= minSignalScore and cooldownOk
+qualitySell = regimeOk and alignSell and candleSell and scoreSell >= minSignalScore and cooldownOk
+
+baseOk = executionReady and warmedUp and inSession
+
+sigFlipBuy  = baseOk and (isRaw ? flipUp : windowBuy and qualityBuy)
+sigFlipSell = baseOk and (isRaw ? flipDn : windowSell and qualitySell)
+sigContBuy  = baseOk and not isRaw and not sigFlipBuy and contBuy and qualityBuy
+sigContSell = baseOk and not isRaw and not sigFlipSell and contSell and qualitySell
+
+triggerBuy  = sigFlipBuy or sigContBuy
+triggerSell = sigFlipSell or sigContSell
+
+f_tick(bool ok) =>
+    ok ? "✔ " : "✘ "
+
+f_breakdown(bool t, bool h, bool m, bool v, bool l) =>
+    f_tick(t) + "Local trend\n" + f_tick(h) + "HTF bias\n" + f_tick(m) + "Momentum\n" + f_tick(v) + "Volume flow\n" + f_tick(l) + "Location"
+
+f_rejectReasons(bool alignOk, bool candleOk, int score) =>
+    string r = ""
+    if isChoppy
+        r += "\n• Choppy regime (ADX " + str.tostring(adxVal, "#.0") + " / CI " + str.tostring(chopIndex, "#.0") + ")"
+    if isTightChop
+        r += "\n• Inside tight consolidation box"
+    if not alignOk
+        r += "\n• Against local/HTF trend (Swing mode)"
+    if not candleOk
+        r += "\n• Weak confirmation candle"
+    if score < minSignalScore
+        r += "\n• Score " + str.tostring(score) + "/5 below minimum " + str.tostring(minSignalScore)
+    if not cooldownOk
+        r += "\n• Cooldown active"
+    r
+
+// Filtered flips: dot on the flip bar, removed again if the flip confirms inside the window
+if showSignals and showDimmedWeak and executionReady and warmedUp and inSession and not isRaw
+    if flipUp and not sigFlipBuy
+        pendingDot := label.new(n, low, "•", color = color.new(color.gray, 80), style = label.style_label_up, textcolor = color.gray, yloc = yloc.belowbar, size = size.tiny, tooltip = "Filtered BUY flip" + f_rejectReasons(alignBuy, candleBuy, scoreBuy) + "\n(May still confirm within " + str.tostring(confirmWindow) + " bars)")
+    if flipDn and not sigFlipSell
+        pendingDot := label.new(n, high, "•", color = color.new(color.gray, 80), style = label.style_label_down, textcolor = color.gray, yloc = yloc.abovebar, size = size.tiny, tooltip = "Filtered SELL flip" + f_rejectReasons(alignSell, candleSell, scoreSell) + "\n(May still confirm within " + str.tostring(confirmWindow) + " bars)")
+
+if sigFlipBuy or sigFlipSell
+    label.delete(pendingDot)
+    pendingDot := na
+
+if triggerBuy or triggerSell
+    legSignaled   := true
+    lastSignalBar := n
+
+// Candle Coloring
+color candleColor = na
+if candleColorType == "Confirmation Simple"
+    candleColor := trendUp ? #00897b : #e53935
+else if candleColorType == "Confirmation Gradient"
+    candleColor := isChoppy or isTightChop ? #787b86 : trendUp ? (localBull ? #00e676 : #26a69a) : (localBear ? #ff1744 : #ef5350)
+
+barcolor(candleColorType != "None" ? candleColor : na)
+
+// # ============================[ACTIVE TRADE MANAGEMENT]============================ #
 f_cleanup_levels() =>
     line.delete(l_entry)
     line.delete(l_sl)
@@ -192,21 +303,108 @@ f_cleanup_levels() =>
     label.delete(lbl_tp1)
     label.delete(lbl_tp2)
 
-if showSignals
-    // Long Order Entry
-    if triggerBuy
-        f_cleanup_levels()
-        activeDir   := 1
-        activeEntry := close
-        tp1Reached  := false
-        
-        slDist    = atr14 * rrMultiplierSL
-        activeSL  := activeEntry - slDist
-        activeTP1 := activeEntry + (slDist * rrRatioTP1)
-        activeTP2 := activeEntry + (slDist * rrRatioTP2)
-        projEnd   = n + 12
+f_fmt(float v) =>
+    str.tostring(v, format.mintick)
 
-        label.new(n, low - atr30 * 0.4, str.tostring(scoreBuy), color = #00897b, style = label.style_label_up, textcolor = color.white, yloc = yloc.belowbar, size = size.small)
+f_fmtR(float r) =>
+    (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R"
+
+f_markOutcome(float price, string txt, float r) =>
+    if showSignals and showOutcomes
+        label.new(n, price, txt + " " + f_fmtR(r), color = color.new(color.black, 100), style = label.style_label_left, textcolor = r > 0 ? #26a69a : r < 0 ? #ef5350 : color.yellow, size = size.tiny)
+
+// 1. Exits for the open trade. Bars after the entry bar only; if SL and a target are touched on the same
+//    bar the SL is assumed first (OHLC cannot tell the order), so stats are never flattered.
+bool   exitNow   = false
+float  exitPrice = na
+float  exitR     = na
+string exitTxt   = ""
+
+if activeDir != 0 and n > entryBar
+    bool hitSL  = activeDir == 1 ? low <= activeSL : high >= activeSL
+    bool hitTP1 = activeDir == 1 ? high >= activeTP1 : low <= activeTP1
+    bool hitTP2 = activeDir == 1 ? high >= activeTP2 : low <= activeTP2
+    if not tp1Reached
+        if hitSL
+            exitNow   := true
+            exitPrice := activeSL
+            exitR     := -1.0
+            exitTxt   := "SL"
+        else if hitTP1
+            tp1Reached := true
+            if hitTP2
+                exitNow   := true
+                exitPrice := activeTP2
+                exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * rrRatioTP2
+                exitTxt   := "TP2"
+            else if autoBreakEven
+                activeSL := activeEntry
+                line.set_y1(l_sl, activeSL)
+                line.set_y2(l_sl, activeSL)
+                line.set_color(l_sl, color.yellow)
+                label.set_y(lbl_sl, activeSL)
+                label.set_text(lbl_sl, "SL [BE]: " + f_fmt(activeSL))
+                label.set_color(lbl_sl, color.yellow)
+    else
+        if hitSL
+            exitNow   := true
+            exitPrice := activeSL
+            exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * (activeSL - activeEntry) * activeDir / activeRisk
+            exitTxt   := activeSL == activeEntry ? "BE" : "SL"
+        else if hitTP2
+            exitNow   := true
+            exitPrice := activeTP2
+            exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * rrRatioTP2
+            exitTxt   := "TP2"
+
+if exitNow
+    statTrades += 1
+    statWins   += exitR > 0 ? 1 : 0
+    statTp1    += tp1Reached ? 1 : 0
+    statNetR   += exitR
+    activeDir  := 0
+    line.set_x2(l_entry, n)
+    line.set_x2(l_sl, n)
+    line.set_x2(l_tp1, n)
+    line.set_x2(l_tp2, n)
+    label.set_x(lbl_sl, n)
+    label.set_x(lbl_tp1, n)
+    label.set_x(lbl_tp2, n)
+    f_markOutcome(exitPrice, exitTxt, exitR)
+
+// 2. New entries (any open trade is closed at market first)
+if triggerBuy or triggerSell
+    int  dir     = triggerBuy ? 1 : -1
+    bool isCont  = sigContBuy or sigContSell
+    int  score   = dir == 1 ? scoreBuy : scoreSell
+
+    if activeDir != 0
+        float openR = (close - activeEntry) * activeDir / activeRisk
+        float closeR = tp1Reached ? tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * openR : openR
+        statTrades += 1
+        statWins   += closeR > 0 ? 1 : 0
+        statTp1    += tp1Reached ? 1 : 0
+        statNetR   += closeR
+        f_markOutcome(close, activeDir == -dir ? "REV" : "EXIT", closeR)
+
+    float atrDist   = atrRisk * rrMultiplierSL
+    float swingDist = dir == 1 ? close - swingLowStop + atrRisk * 0.1 : swingHighStop - close + atrRisk * 0.1
+    float slDist    = stopMethod == "ATR" ? atrDist : math.min(math.max(atrDist, swingDist), math.max(maxStopAtr, rrMultiplierSL) * atrRisk)
+
+    activeDir   := dir
+    activeEntry := close
+    activeRisk  := slDist
+    activeSL    := close - dir * slDist
+    activeTP1   := close + dir * slDist * rrRatioTP1
+    activeTP2   := close + dir * slDist * rrRatioTP2
+    tp1Reached  := false
+    entryBar    := n
+
+    if showSignals
+        f_cleanup_levels()
+        projEnd = n + 5
+        string tip = (dir == 1 ? "BUY" : "SELL") + (isRaw ? " · raw flip" : isCont ? " · trend continuation" : " · trend flip") + "\nScore " + str.tostring(score) + "/5\n" + (dir == 1 ? f_breakdown(ptTrendBuy, ptHtfBuy, momentumBull, volumeBull, ptLocBuy) : f_breakdown(ptTrendSell, ptHtfSell, momentumBear, volumeBear, ptLocSell)) + "\nADX " + str.tostring(adxVal, "#.0") + " · CI " + str.tostring(chopIndex, "#.0") + "\nEntry " + f_fmt(activeEntry) + " · SL " + f_fmt(activeSL) + "\nTP1 " + f_fmt(activeTP1) + " · TP2 " + f_fmt(activeTP2)
+        label.new(n, dir == 1 ? low : high, (isCont ? "C" : "") + str.tostring(score), color = dir == 1 ? #00897b : #e53935, style = dir == 1 ? label.style_label_up : label.style_label_down, textcolor = color.white, yloc = dir == 1 ? yloc.belowbar : yloc.abovebar, size = size.small, tooltip = tip)
 
         if showTradeLevels
             l_entry := line.new(n, activeEntry, projEnd, activeEntry, color = color.gray, style = line.style_dotted)
@@ -214,115 +412,43 @@ if showSignals
             l_tp1   := line.new(n, activeTP1, projEnd, activeTP1, color = color.teal, width = 1, style = line.style_dashed)
             l_tp2   := line.new(n, activeTP2, projEnd, activeTP2, color = color.green, width = 2, style = line.style_solid)
 
-            lbl_sl  := label.new(projEnd, activeSL, "SL: " + str.tostring(activeSL, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_left, size = size.tiny)
-            lbl_tp1 := label.new(projEnd, activeTP1, "TP1: " + str.tostring(activeTP1, "#.##"), color = color.teal, textcolor = color.white, style = label.style_label_left, size = size.tiny)
-            lbl_tp2 := label.new(projEnd, activeTP2, "TP2: " + str.tostring(activeTP2, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_left, size = size.tiny)
+            lbl_sl  := label.new(projEnd, activeSL, "SL: " + f_fmt(activeSL), color = color.red, textcolor = color.white, style = label.style_label_left, size = size.tiny)
+            lbl_tp1 := label.new(projEnd, activeTP1, "TP1: " + f_fmt(activeTP1), color = color.teal, textcolor = color.white, style = label.style_label_left, size = size.tiny)
+            lbl_tp2 := label.new(projEnd, activeTP2, "TP2: " + f_fmt(activeTP2), color = color.green, textcolor = color.white, style = label.style_label_left, size = size.tiny)
 
-        string payloadBuy = '{"action": "BUY", "ticker": "' + syminfo.ticker + '", "score": ' + str.tostring(scoreBuy) + ', "entry": ' + str.tostring(activeEntry, "#.##") + ', "sl": ' + str.tostring(activeSL, "#.##") + ', "tp1": ' + str.tostring(activeTP1, "#.##") + '}'
-        alert(payloadBuy, alert.freq_once_per_bar_close)
+    string payload = '{"action": "' + (dir == 1 ? "BUY" : "SELL") + '", "type": "' + (isCont ? "continuation" : "flip") + '", "ticker": "' + syminfo.ticker + '", "score": ' + str.tostring(score) + ', "entry": ' + f_fmt(activeEntry) + ', "sl": ' + f_fmt(activeSL) + ', "tp1": ' + f_fmt(activeTP1) + ', "tp2": ' + f_fmt(activeTP2) + '}'
+    alert(payload, alert.freq_once_per_bar_close)
 
-    if dimmedBuy
-        label.new(n, low - atr30 * 0.4, "•", color = color.new(color.gray, 80), style = label.style_label_up, textcolor = color.gray, yloc = yloc.belowbar, size = size.tiny)
-
-    // Short Order Entry
-    if triggerSell
-        f_cleanup_levels()
-        activeDir   := -1
-        activeEntry := close
-        tp1Reached  := false
-        
-        slDist    = atr14 * rrMultiplierSL
-        activeSL  := activeEntry + slDist
-        activeTP1 := activeEntry - (slDist * rrRatioTP1)
-        activeTP2 := activeEntry - (slDist * rrRatioTP2)
-        projEnd   = n + 12
-
-        label.new(n, high + atr30 * 0.4, str.tostring(scoreSell), color = #e53935, style = label.style_label_down, textcolor = color.white, yloc = yloc.abovebar, size = size.small)
-
-        if showTradeLevels
-            l_entry := line.new(n, activeEntry, projEnd, activeEntry, color = color.gray, style = line.style_dotted)
-            l_sl    := line.new(n, activeSL, projEnd, activeSL, color = color.red, width = 1, style = line.style_dashed)
-            l_tp1   := line.new(n, activeTP1, projEnd, activeTP1, color = color.teal, width = 1, style = line.style_dashed)
-            l_tp2   := line.new(n, activeTP2, projEnd, activeTP2, color = color.green, width = 2, style = line.style_solid)
-
-            lbl_sl  := label.new(projEnd, activeSL, "SL: " + str.tostring(activeSL, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_left, size = size.tiny)
-            lbl_tp1 := label.new(projEnd, activeTP1, "TP1: " + str.tostring(activeTP1, "#.##"), color = color.teal, textcolor = color.white, style = label.style_label_left, size = size.tiny)
-            lbl_tp2 := label.new(projEnd, activeTP2, "TP2: " + str.tostring(activeTP2, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_left, size = size.tiny)
-
-        string payloadSell = '{"action": "SELL", "ticker": "' + syminfo.ticker + '", "score": ' + str.tostring(scoreSell) + ', "entry": ' + str.tostring(activeEntry, "#.##") + ', "sl": ' + str.tostring(activeSL, "#.##") + ', "tp1": ' + str.tostring(activeTP1, "#.##") + '}'
-        alert(payloadSell, alert.freq_once_per_bar_close)
-
-    if dimmedSell
-        label.new(n, high + atr30 * 0.4, "•", color = color.new(color.gray, 80), style = label.style_label_down, textcolor = color.gray, yloc = yloc.abovebar, size = size.tiny)
-
-// Dynamic Projections & Break-Even Tracking
-if activeDir == 1 and not na(activeEntry)
-    line.set_x2(l_entry, n + 4)
-    line.set_x2(l_sl, n + 4)
-    line.set_x2(l_tp1, n + 4)
-    line.set_x2(l_tp2, n + 4)
-    label.set_x(lbl_sl, n + 4)
-    label.set_x(lbl_tp1, n + 4)
-    label.set_x(lbl_tp2, n + 4)
-
-    if high >= activeTP1 and not tp1Reached
-        tp1Reached := true
-        if autoBreakEven
-            activeSL := activeEntry
-            line.set_y1(l_sl, activeSL)
-            line.set_y2(l_sl, activeSL)
-            line.set_color(l_sl, color.yellow)
-            label.set_y(lbl_sl, activeSL)
-            label.set_text(lbl_sl, "SL [BE]: " + str.tostring(activeSL, "#.##"))
-            label.set_color(lbl_sl, color.yellow)
-
-    if low <= activeSL or high >= activeTP2
-        activeDir := 0
-
-else if activeDir == -1 and not na(activeEntry)
-    line.set_x2(l_entry, n + 4)
-    line.set_x2(l_sl, n + 4)
-    line.set_x2(l_tp1, n + 4)
-    line.set_x2(l_tp2, n + 4)
-    label.set_x(lbl_sl, n + 4)
-    label.set_x(lbl_tp1, n + 4)
-    label.set_x(lbl_tp2, n + 4)
-
-    if low <= activeTP1 and not tp1Reached
-        tp1Reached := true
-        if autoBreakEven
-            activeSL := activeEntry
-            line.set_y1(l_sl, activeSL)
-            line.set_y2(l_sl, activeSL)
-            line.set_color(l_sl, color.yellow)
-            label.set_y(lbl_sl, activeSL)
-            label.set_text(lbl_sl, "SL [BE]: " + str.tostring(activeSL, "#.##"))
-            label.set_color(lbl_sl, color.yellow)
-
-    if high >= activeSL or low <= activeTP2
-        activeDir := 0
+// 3. Keep the projection attached to price while the trade is open
+if activeDir != 0
+    line.set_x2(l_entry, n + 5)
+    line.set_x2(l_sl, n + 5)
+    line.set_x2(l_tp1, n + 5)
+    line.set_x2(l_tp2, n + 5)
+    label.set_x(lbl_sl, n + 5)
+    label.set_x(lbl_tp1, n + 5)
+    label.set_x(lbl_tp2, n + 5)
 
 alertcondition(triggerBuy,  title = "Scalper Buy Signal",  message = "AhmadZ Scalper Buy Triggered")
 alertcondition(triggerSell, title = "Scalper Sell Signal", message = "AhmadZ Scalper Sell Triggered")
 
 // # ============================[HUD DASHBOARD]============================ #
 tbl_pos = dashboardLocation == 'Bottom Left' ? position.bottom_left : dashboardLocation == 'Top Right' ? position.top_right : position.bottom_right
-tbl_sz  = dashboardSize == 'Tiny' ? size.tiny : dashboardSize == 'Small' ? size.small : size.normal
+tbl_sz  = dashboardSize == 'Tiny' ? size.tiny : dashboardSize == 'Small' ? size.small : dashboardSize == 'Large' ? size.large : size.normal
 
-tb = table.new(tbl_pos, 2, 5, bgcolor = #141722, border_color = #232736, border_width = 1, frame_color = #232736, frame_width = 1)
+var table tb = table.new(tbl_pos, 2, 9, bgcolor = #141722, border_color = #232736, border_width = 1, frame_color = #232736, frame_width = 1)
+
+f_row(int r, string k, string v, color c) =>
+    table.cell(tb, 0, r, k, text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = c, text_size = tbl_sz)
 
 if showDashboard and barstate.islast
-    table.cell(tb, 0, 0, "⚡ Mode", text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
-    table.cell(tb, 1, 0, signalMode, text_color = color.white, text_size = tbl_sz)
-
-    table.cell(tb, 0, 1, "📈 Trend (Local)", text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
-    table.cell(tb, 1, 1, localBull ? "BULLISH" : localBear ? "BEARISH" : "NEUTRAL", text_color = localBull ? color.teal : localBear ? color.red : color.silver, text_size = tbl_sz)
-
-    table.cell(tb, 0, 2, "💧 Vol Momentum", text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
-    table.cell(tb, 1, 2, volumeBull ? "BUY FLOW" : "SELL FLOW", text_color = volumeBull ? color.teal : color.red, text_size = tbl_sz)
-
-    table.cell(tb, 0, 3, "🎯 Position", text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
-    table.cell(tb, 1, 3, activeDir == 1 ? (tp1Reached ? "LONG (BE)" : "LONG") : activeDir == -1 ? (tp1Reached ? "SHORT (BE)" : "SHORT") : "FLAT", text_color = activeDir != 0 ? color.yellow : color.silver, text_size = tbl_sz)
-
-    table.cell(tb, 0, 4, "📊 Market Structure", text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
-    table.cell(tb, 1, 4, isTightChop ? "TIGHT CHOP" : inTruePremium ? "PREMIUM" : inTrueDiscount ? "DISCOUNT" : "MID-RANGE", text_color = isTightChop ? color.orange : inTruePremium ? color.red : inTrueDiscount ? color.teal : color.silver, text_size = tbl_sz)
+    f_row(0, "⚡ Mode", signalMode, color.white)
+    f_row(1, "📈 Trend (Local)", localBull ? "BULLISH" : localBear ? "BEARISH" : "NEUTRAL", localBull ? color.teal : localBear ? color.red : color.silver)
+    f_row(2, "🧭 HTF Bias (" + htfTimeframe + ")", htfActive ? (htfBull ? "BULLISH" : htfBear ? "BEARISH" : "NEUTRAL") : "OFF", htfActive ? (htfBull ? color.teal : htfBear ? color.red : color.silver) : color.gray)
+    f_row(3, "🌊 Regime", (isChoppy ? "CHOP" : "TRENDING") + " · ADX " + str.tostring(adxVal, "#") + " · CI " + str.tostring(chopIndex, "#"), isChoppy ? color.orange : color.teal)
+    f_row(4, "💧 Vol Momentum", hasVolume ? (volFlow > 0 ? "BUY FLOW" : "SELL FLOW") : "N/A", hasVolume ? (volFlow > 0 ? color.teal : color.red) : color.gray)
+    f_row(5, "📊 Market Structure", isTightChop ? "TIGHT CHOP" : inTruePremium ? "PREMIUM" : inTrueDiscount ? "DISCOUNT" : "MID-RANGE", isTightChop ? color.orange : inTruePremium ? color.red : inTrueDiscount ? color.teal : color.silver)
+    f_row(6, "🧮 Live Score", "BUY " + str.tostring(scoreBuy) + "/5 · SELL " + str.tostring(scoreSell) + "/5", color.white)
+    f_row(7, "🎯 Position", activeDir == 1 ? (tp1Reached ? "LONG (BE)" : "LONG") : activeDir == -1 ? (tp1Reached ? "SHORT (BE)" : "SHORT") : "FLAT", activeDir != 0 ? color.yellow : color.silver)
+    f_row(8, "🏁 Closed Trades", statTrades == 0 ? "—" : str.tostring(statTrades) + " · Win " + str.tostring(100.0 * statWins / statTrades, "#") + "% · TP1 " + str.tostring(100.0 * statTp1 / statTrades, "#") + "% · " + f_fmtR(statNetR), statNetR >= 0 ? color.teal : color.red)
