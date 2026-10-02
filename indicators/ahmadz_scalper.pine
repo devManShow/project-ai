@@ -89,8 +89,8 @@ localTurnDn = close < emaFast and emaFast < emaFast[1]
 
 // Higher-timeframe bias: [1] + lookahead_on = last closed HTF bar, no repainting
 htfActive = useHtfFilter and timeframe.in_seconds(htfTimeframe) > timeframe.in_seconds(timeframe.period)
-htfTf     = htfActive ? htfTimeframe : timeframe.period
-[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfEmaLen)[1]], lookahead = barmerge.lookahead_on)
+htfClose  = request.security(syminfo.tickerid, htfTimeframe, close[1], lookahead = barmerge.lookahead_on)
+htfEma    = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
 htfBull = htfClose > htfEma
 htfBear = htfClose < htfEma
 
@@ -247,26 +247,26 @@ sigContSell = baseOk and not isRaw and not sigFlipSell and contSell and qualityS
 triggerBuy  = sigFlipBuy or sigContBuy
 triggerSell = sigFlipSell or sigContSell
 
-f_tick(bool ok) =>
+f_tick(ok) =>
     ok ? "✔ " : "✘ "
 
-f_breakdown(bool t, bool h, bool m, bool v, bool l) =>
+f_breakdown(t, h, m, v, l) =>
     f_tick(t) + "Local trend\n" + f_tick(h) + "HTF bias\n" + f_tick(m) + "Momentum\n" + f_tick(v) + "Volume flow\n" + f_tick(l) + "Location"
 
-f_rejectReasons(bool alignOk, bool candleOk, int score) =>
+f_rejectReasons(alignOk, candleOk, score) =>
     string r = ""
     if isChoppy
-        r += "\n• Choppy regime (ADX " + str.tostring(adxVal, "#.0") + " / CI " + str.tostring(chopIndex, "#.0") + ")"
+        r := r + "\n• Choppy regime (ADX " + str.tostring(adxVal, "#.0") + " / CI " + str.tostring(chopIndex, "#.0") + ")"
     if isTightChop
-        r += "\n• Inside tight consolidation box"
+        r := r + "\n• Inside tight consolidation box"
     if not alignOk
-        r += "\n• Against local/HTF trend (Swing mode)"
+        r := r + "\n• Against local/HTF trend (Swing mode)"
     if not candleOk
-        r += "\n• Weak confirmation candle"
+        r := r + "\n• Weak confirmation candle"
     if score < minSignalScore
-        r += "\n• Score " + str.tostring(score) + "/5 below minimum " + str.tostring(minSignalScore)
+        r := r + "\n• Score " + str.tostring(score) + "/5 below minimum " + str.tostring(minSignalScore)
     if not cooldownOk
-        r += "\n• Cooldown active"
+        r := r + "\n• Cooldown active"
     r
 
 // Filtered flips: dot on the flip bar, removed again if the flip confirms inside the window
@@ -303,65 +303,47 @@ f_cleanup_levels() =>
     label.delete(lbl_tp1)
     label.delete(lbl_tp2)
 
-f_fmt(float v) =>
+f_fmt(v) =>
     str.tostring(v, format.mintick)
 
-f_fmtR(float r) =>
+f_fmtR(r) =>
     (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R"
 
-f_markOutcome(float price, string txt, float r) =>
-    if showSignals and showOutcomes
-        label.new(n, price, txt + " " + f_fmtR(r), color = color.new(color.black, 100), style = label.style_label_left, textcolor = r > 0 ? #26a69a : r < 0 ? #ef5350 : color.yellow, size = size.tiny)
+f_markOutcome(price, txt, r) =>
+    label.new(n, price, txt + " " + f_fmtR(r), color = color.new(color.black, 100), style = label.style_label_left, textcolor = r > 0 ? #26a69a : r < 0 ? #ef5350 : color.yellow, size = size.tiny)
 
 // 1. Exits for the open trade. Bars after the entry bar only; if SL and a target are touched on the same
 //    bar the SL is assumed first (OHLC cannot tell the order), so stats are never flattered.
-bool   exitNow   = false
-float  exitPrice = na
-float  exitR     = na
-string exitTxt   = ""
+inTrade   = activeDir != 0 and n > entryBar
+hitSL     = inTrade and (activeDir == 1 ? low <= activeSL : high >= activeSL)
+hitTP1    = inTrade and not tp1Reached and (activeDir == 1 ? high >= activeTP1 : low <= activeTP1)
+hitTP2    = inTrade and (activeDir == 1 ? high >= activeTP2 : low <= activeTP2)
+tp1Part   = tp1Frac * rrRatioTP1
+stopOut   = hitSL
+tp1Now    = not stopOut and hitTP1
+tp2Exit   = not stopOut and hitTP2 and (tp1Reached or tp1Now)
+exitNow   = stopOut or tp2Exit
+exitPrice = stopOut ? activeSL : activeTP2
+exitR     = stopOut ? (tp1Reached ? tp1Part + (1.0 - tp1Frac) * (activeSL - activeEntry) * activeDir / activeRisk : -1.0) : tp1Part + (1.0 - tp1Frac) * rrRatioTP2
+exitTxt   = stopOut ? (tp1Reached and activeSL == activeEntry ? "BE" : "SL") : "TP2"
 
-if activeDir != 0 and n > entryBar
-    bool hitSL  = activeDir == 1 ? low <= activeSL : high >= activeSL
-    bool hitTP1 = activeDir == 1 ? high >= activeTP1 : low <= activeTP1
-    bool hitTP2 = activeDir == 1 ? high >= activeTP2 : low <= activeTP2
-    if not tp1Reached
-        if hitSL
-            exitNow   := true
-            exitPrice := activeSL
-            exitR     := -1.0
-            exitTxt   := "SL"
-        else if hitTP1
-            tp1Reached := true
-            if hitTP2
-                exitNow   := true
-                exitPrice := activeTP2
-                exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * rrRatioTP2
-                exitTxt   := "TP2"
-            else if autoBreakEven
-                activeSL := activeEntry
-                line.set_y1(l_sl, activeSL)
-                line.set_y2(l_sl, activeSL)
-                line.set_color(l_sl, color.yellow)
-                label.set_y(lbl_sl, activeSL)
-                label.set_text(lbl_sl, "SL [BE]: " + f_fmt(activeSL))
-                label.set_color(lbl_sl, color.yellow)
-    else
-        if hitSL
-            exitNow   := true
-            exitPrice := activeSL
-            exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * (activeSL - activeEntry) * activeDir / activeRisk
-            exitTxt   := activeSL == activeEntry ? "BE" : "SL"
-        else if hitTP2
-            exitNow   := true
-            exitPrice := activeTP2
-            exitR     := tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * rrRatioTP2
-            exitTxt   := "TP2"
+if tp1Now
+    tp1Reached := true
+
+if tp1Now and autoBreakEven and not tp2Exit
+    activeSL := activeEntry
+    line.set_y1(l_sl, activeSL)
+    line.set_y2(l_sl, activeSL)
+    line.set_color(l_sl, color.yellow)
+    label.set_y(lbl_sl, activeSL)
+    label.set_text(lbl_sl, "SL [BE]: " + f_fmt(activeSL))
+    label.set_color(lbl_sl, color.yellow)
 
 if exitNow
-    statTrades += 1
-    statWins   += exitR > 0 ? 1 : 0
-    statTp1    += tp1Reached ? 1 : 0
-    statNetR   += exitR
+    statTrades := statTrades + 1
+    statWins   := statWins + (exitR > 0 ? 1 : 0)
+    statTp1    := statTp1 + (tp1Reached ? 1 : 0)
+    statNetR   := statNetR + exitR
     activeDir  := 0
     line.set_x2(l_entry, n)
     line.set_x2(l_sl, n)
@@ -370,7 +352,8 @@ if exitNow
     label.set_x(lbl_sl, n)
     label.set_x(lbl_tp1, n)
     label.set_x(lbl_tp2, n)
-    f_markOutcome(exitPrice, exitTxt, exitR)
+    if showSignals and showOutcomes
+        f_markOutcome(exitPrice, exitTxt, exitR)
 
 // 2. New entries (any open trade is closed at market first)
 if triggerBuy or triggerSell
@@ -381,11 +364,12 @@ if triggerBuy or triggerSell
     if activeDir != 0
         float openR = (close - activeEntry) * activeDir / activeRisk
         float closeR = tp1Reached ? tp1Frac * rrRatioTP1 + (1.0 - tp1Frac) * openR : openR
-        statTrades += 1
-        statWins   += closeR > 0 ? 1 : 0
-        statTp1    += tp1Reached ? 1 : 0
-        statNetR   += closeR
-        f_markOutcome(close, activeDir == -dir ? "REV" : "EXIT", closeR)
+        statTrades := statTrades + 1
+        statWins   := statWins + (closeR > 0 ? 1 : 0)
+        statTp1    := statTp1 + (tp1Reached ? 1 : 0)
+        statNetR   := statNetR + closeR
+        if showSignals and showOutcomes
+            f_markOutcome(close, activeDir == -dir ? "REV" : "EXIT", closeR)
 
     float atrDist   = atrRisk * rrMultiplierSL
     float swingDist = dir == 1 ? close - swingLowStop + atrRisk * 0.1 : swingHighStop - close + atrRisk * 0.1
@@ -438,7 +422,7 @@ tbl_sz  = dashboardSize == 'Tiny' ? size.tiny : dashboardSize == 'Small' ? size.
 
 var table tb = table.new(tbl_pos, 2, 9, bgcolor = #141722, border_color = #232736, border_width = 1, frame_color = #232736, frame_width = 1)
 
-f_row(int r, string k, string v, color c) =>
+f_row(r, k, v, c) =>
     table.cell(tb, 0, r, k, text_color = color.silver, text_size = tbl_sz, text_halign = text.align_left)
     table.cell(tb, 1, r, v, text_color = c, text_size = tbl_sz)
 
