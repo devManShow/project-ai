@@ -1,0 +1,656 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+//  PDH / PDL Liquidity Sweep + MSS  [Filtered]
+// ──────────────────────────────────────────────────────────────────────────────
+//  The previous day's high (PDH = buy-side liquidity) and low (PDL = sell-side
+//  liquidity) are the most important external liquidity pools on the chart. A
+//  sweep of either level followed by a reversal is the classic Turtle Soup /
+//  AMD (Judas swing) model - but it is NOT a stand-alone edge that "works with
+//  any strategy". Fading every sweep gets run over in trending markets, and the
+//  full PDL -> PDH (or PDH -> PDL) run is the exception, not the rule.
+//
+//  This indicator therefore only signals when the context agrees:
+//
+//   1. HTF context
+//      - HTF bias (EMA trend on a higher timeframe + optional confluence TF):
+//        shorts at PDH only with a bearish bias, longs at PDL only with a
+//        bullish bias.
+//      - Expansion filter: no fading after N consecutive daily expansion days
+//        (the "strong trend trap").
+//      - Optional premium / discount filter against last week's range.
+//      - Optional HTF FVG (point of interest) confluence at the sweep.
+//   2. LTF confirmation
+//      - Sweep: trade through PDH/PDL, then close back inside within N bars
+//        (longer acceptance outside the range = breakout, not a sweep).
+//      - MSS: close through the last swing point that started the leg into
+//        the swept level (change of character).
+//      - Displacement: large-bodied candle and/or a fresh FVG in the move away.
+//   3. Risk & targets
+//      - SL beyond the sweep extreme (+ ATR buffer).
+//      - TP1 = equilibrium (50 %) of the previous day's range -> partial close.
+//      - TP2 = the opposite previous-day level.
+//      - Optional break-even after TP1, flat at day end, built-in R statistics.
+//
+//  Signals are evaluated on bar close only and all higher-timeframe data comes
+//  from completed bars, so nothing repaints. Intrabar order is unknown on
+//  historical bars: when a stop and a target are touched in the same bar the
+//  stop is assumed to have been hit first, so the statistics are conservative.
+//
+//  For education and research only - not financial advice.
+// ══════════════════════════════════════════════════════════════════════════════
+indicator("PDH/PDL Liquidity Sweep + MSS [Filtered]", shorttitle = "PDH/PDL Sweep", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+G_LVL  = "Previous day levels"
+G_BIAS = "1 · HTF context"
+G_POI  = "1 · HTF point of interest (FVG)"
+G_SWP  = "2 · Sweep"
+G_CONF = "2 · LTF confirmation (MSS + displacement)"
+G_RISK = "3 · Risk, targets & partials"
+G_SESS = "Session filter"
+G_VIS  = "Visuals"
+
+showLevels   = input.bool(true, "Show PDH / PDL", group = G_LVL, inline = "lv")
+showEq       = input.bool(true, "Show EQ (50%)", group = G_LVL, inline = "lv")
+pdhColor     = input.color(#f23645, "PDH", group = G_LVL, inline = "lc")
+pdlColor     = input.color(#089981, "PDL", group = G_LVL, inline = "lc")
+eqColor      = input.color(#787b86, "EQ", group = G_LVL, inline = "lc")
+
+useBias      = input.bool(true, "Trade only with the HTF bias", group = G_BIAS, tooltip = "Bullish = HTF close above its EMA (and EMA rising); bearish = close below the EMA (and EMA falling). PDH sweeps are only sold in a bearish bias, PDL sweeps only bought in a bullish bias.")
+biasTf       = input.timeframe("D", "Bias timeframe", group = G_BIAS, inline = "b1")
+biasLen      = input.int(50, "EMA", minval = 1, group = G_BIAS, inline = "b1")
+useBias2     = input.bool(false, "Confluence TF", group = G_BIAS, inline = "b2", tooltip = "When enabled, both timeframes must agree; any disagreement makes the bias neutral.")
+bias2Tf      = input.timeframe("W", "", group = G_BIAS, inline = "b2")
+bias2Len     = input.int(20, "EMA", minval = 1, group = G_BIAS, inline = "b2")
+needSlope    = input.bool(true, "Require EMA slope agreement", group = G_BIAS)
+allowNeutral = input.bool(false, "Allow trades when the bias is neutral", group = G_BIAS)
+useExp       = input.bool(true, "Block fades during daily expansion", group = G_BIAS, tooltip = "In a strong trend price breaks the previous day's high (or low) day after day. After this many consecutive expansion days, sweeps against the trend are not traded.")
+expMode      = input.string("Close beyond PD level", "Expansion day =", options = ["Close beyond PD level", "HH+HL / LH+LL"], group = G_BIAS)
+expDays      = input.int(2, "Consecutive expansion days", minval = 1, group = G_BIAS)
+usePd        = input.bool(false, "Premium / discount vs. last week's range", group = G_BIAS, tooltip = "Shorts only when PDH sits in the upper (premium) half of last week's range; longs only when PDL sits in the lower (discount) half.")
+
+usePoi       = input.bool(false, "Require an HTF FVG at the sweep", group = G_POI, tooltip = "The sweep wick must trade into an unmitigated HTF fair value gap (bearish FVG for PDH sweeps, bullish FVG for PDL sweeps). When disabled the confluence is still reported in the signal tooltip.")
+poiTf        = input.timeframe("240", "POI timeframe", group = G_POI)
+showPoi      = input.bool(true, "Draw HTF FVG zones", group = G_POI)
+poiMax       = input.int(5, "Zones kept per side", minval = 1, maxval = 50, group = G_POI)
+
+penAtr       = input.float(0.05, "Min penetration (× ATR)", minval = 0.0, step = 0.01, group = G_SWP, tooltip = "How far beyond the level price must trade for the move to count as a sweep.")
+reclaimBars  = input.int(3, "Max bars to close back inside", minval = 0, group = G_SWP, tooltip = "Price must close back inside the previous day's range within this many bars after first trading through the level. 0 = wick-only sweeps.")
+
+swingLen     = input.int(3, "Swing pivot length", minval = 1, maxval = 20, group = G_CONF, tooltip = "Bars on each side that define a swing point. The MSS level is the last swing low (for shorts) or swing high (for longs) formed before the sweep extreme.")
+mssWindow    = input.int(24, "Max bars from sweep to MSS", minval = 1, group = G_CONF)
+reqDisp      = input.bool(true, "Require displacement candle", group = G_CONF, inline = "dp")
+dispAtr      = input.float(1.0, "body ≥ × ATR", minval = 0.1, step = 0.1, group = G_CONF, inline = "dp")
+reqFvg       = input.bool(true, "Require an FVG in the move away", group = G_CONF)
+graceBars    = input.int(2, "Bars allowed after MSS to confirm", minval = 0, group = G_CONF, tooltip = "An FVG needs a third candle to print, so the displacement / FVG requirement may complete a few bars after the structure break.")
+atrLen       = input.int(14, "ATR length", minval = 1, group = G_CONF)
+onePerDay    = input.bool(true, "One signal per side per day", group = G_CONF)
+
+slBufAtr     = input.float(0.1, "SL buffer beyond sweep (× ATR)", minval = 0.0, step = 0.05, group = G_RISK)
+tp1FbR       = input.float(1.0, "TP1 when EQ is already passed (R)", minval = 0.1, step = 0.1, group = G_RISK, tooltip = "If price has already displaced past the 50% level at entry, TP1 falls back to this R multiple (never beyond TP2).")
+partialPct   = input.int(50, "Partial close at TP1 (%)", minval = 0, maxval = 100, group = G_RISK)
+moveBe       = input.bool(true, "Move SL to break-even after TP1", group = G_RISK)
+useMinRR     = input.bool(true, "Min R:R to TP1", group = G_RISK, inline = "rr")
+minRR        = input.float(1.0, "", minval = 0.1, step = 0.1, group = G_RISK, inline = "rr")
+closeEod     = input.bool(true, "Flat at day end", group = G_RISK)
+
+useSess      = input.bool(false, "Signal only inside the session", group = G_SESS)
+sessWin      = input.session("0200-1100", "Session", group = G_SESS)
+sessTz       = input.string("America/New_York", "Timezone (IANA)", group = G_SESS)
+
+showSweeps   = input.bool(true, "Mark sweeps (BSL / SSL)", group = G_VIS)
+showMss      = input.bool(true, "Draw MSS level", group = G_VIS)
+showFvgBox   = input.bool(true, "Draw entry FVG", group = G_VIS)
+showTrades   = input.bool(true, "Draw entry / SL / TP lines", group = G_VIS)
+showBlocked  = input.bool(true, "Show blocked setups (✗, reason in tooltip)", group = G_VIS)
+showDash     = input.bool(true, "Dashboard", group = G_VIS, inline = "db")
+dashPos      = input.string("Top Right", "", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = G_VIS, inline = "db")
+longColor    = input.color(#089981, "Long", group = G_VIS, inline = "sc")
+shortColor   = input.color(#f23645, "Short", group = G_VIS, inline = "sc")
+
+SL_COL  = #f23645
+TP_COL  = #089981
+TXT_COL = #d1d4dc
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Zone
+    float top
+    float bot
+    box   bx
+
+type Setup
+    int   takeBar
+    float takeExt
+    int   takeExtBar
+    bool  armed  = false
+    float extreme
+    int   extremeBar
+    int   sweepBar
+    float mss
+    int   mssBar
+    bool  broken = false
+    int   breakBar
+    bool  disp   = false
+    bool  fvg    = false
+    float fvgTop
+    float fvgBot
+    int   fvgBar
+    bool  poi    = false
+    int   lastSigDay
+
+type Trade
+    int   dir      = 0
+    float entry
+    float sl
+    float risk
+    float tp1
+    float tp2
+    float realized = 0.0
+    bool  tp1Hit   = false
+    int   start
+    line  lE
+    line  lS
+    line  lT1
+    line  lT2
+
+type Stats
+    int   trades = 0
+    int   tp1    = 0
+    int   tp2    = 0
+    int   sl     = 0
+    int   be     = 0
+    int   eod    = 0
+    float netR   = 0.0
+
+// ─── Core series ──────────────────────────────────────────────────────────────
+float pPart   = partialPct / 100.0
+float atr     = ta.atr(atrLen)
+float atrPrev = nz(atr[1], atr)
+bool  tfOk    = timeframe.in_seconds() < 86400
+bool  newDay  = timeframe.change("D")
+
+// Higher-timeframe data: `[1]` + lookahead_on = last completed HTF bar only (no repainting).
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+float pdEq = (pdh + pdl) / 2
+float pwEq = (pwh + pwl) / 2
+
+biasData(simple int len) =>
+    float e = ta.ema(close, len)
+    [close[1], e[1], e[2]]
+
+biasOf(float c, float e, float ePrev) =>
+    bool up = c > e and (not needSlope or e > ePrev)
+    bool dn = c < e and (not needSlope or e < ePrev)
+    up ? 1 : dn ? -1 : 0
+
+[b1C, b1E, b1P] = request.security(syminfo.tickerid, biasTf, biasData(biasLen), lookahead = barmerge.lookahead_on)
+[b2C, b2E, b2P] = request.security(syminfo.tickerid, bias2Tf, biasData(bias2Len), lookahead = barmerge.lookahead_on)
+int bias1   = biasOf(b1C, b1E, b1P)
+int bias2   = biasOf(b2C, b2E, b2P)
+int htfBias = useBias2 ? (bias1 == bias2 ? bias1 : 0) : bias1
+
+// Consecutive daily expansion days (completed days only).
+expData(bool hhhl) =>
+    bool upDay = hhhl ? (high > high[1] and low > low[1]) : close > high[1]
+    bool dnDay = hhhl ? (low < low[1] and high < high[1]) : close < low[1]
+    var int up = 0
+    var int dn = 0
+    up := upDay ? up + 1 : 0
+    dn := dnDay ? dn + 1 : 0
+    [up[1], dn[1]]
+
+[upRun, dnRun] = request.security(syminfo.tickerid, "D", expData(expMode == "HH+HL / LH+LL"), lookahead = barmerge.lookahead_on)
+bool bullExpansion = useExp and nz(upRun) >= expDays
+bool bearExpansion = useExp and nz(dnRun) >= expDays
+
+// Last three completed POI-timeframe candles, for HTF FVG detection.
+[poiH1, poiL1, poiH3, poiL3] = request.security(syminfo.tickerid, poiTf, [high[1], low[1], high[3], low[3]], lookahead = barmerge.lookahead_on)
+bool poiNewBar = timeframe.change(poiTf)
+
+// Context permissions.
+bool biasShortOk   = not useBias or htfBias == -1 or (allowNeutral and htfBias == 0)
+bool biasLongOk    = not useBias or htfBias == 1 or (allowNeutral and htfBias == 0)
+bool pdShortOk     = not usePd or pdh > pwEq
+bool pdLongOk      = not usePd or pdl < pwEq
+bool shortsAllowed = biasShortOk and not bullExpansion and pdShortOk
+bool longsAllowed  = biasLongOk and not bearExpansion and pdLongOk
+bool inSess        = not useSess or not na(time(timeframe.period, sessWin, sessTz))
+
+// Candle features on the chart timeframe.
+float body       = math.abs(close - open)
+bool  bearDisp   = close < open and body >= dispAtr * atrPrev
+bool  bullDisp   = close > open and body >= dispAtr * atrPrev
+bool  bearFvgNow = high < low[2]
+bool  bullFvgNow = low > high[2]
+float high2      = high[2]
+float low2       = low[2]
+float pivH       = ta.pivothigh(high, swingLen, swingLen)
+float pivL       = ta.pivotlow(low, swingLen, swingLen)
+
+var int dayId = 0
+if newDay
+    dayId += 1
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+fmtR(float r) =>
+    float v = math.round(r, 2)
+    (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+
+pct(int a, int n) =>
+    str.tostring(100.0 * a / n, "#") + "%"
+
+tfName(simple string tf) =>
+    int s = timeframe.in_seconds(tf)
+    string r = tf
+    if s >= 86400
+        r := s == 86400 ? "D" : s == 604800 ? "W" : tf
+    else if s % 3600 == 0
+        r := str.tostring(math.floor(s / 3600.0)) + "H"
+    else
+        r := str.tostring(math.floor(s / 60.0)) + "m"
+    r
+
+biasTxt(int b) =>
+    b == 1 ? "Bullish ▲" : b == -1 ? "Bearish ▼" : "Neutral"
+
+biasCol(int b) =>
+    b == 1 ? longColor : b == -1 ? shortColor : color.gray
+
+// Most recent swing (value, bar) formed before `beforeBar` that lies below / above `limit`.
+findSwing(array<float> vals, array<int> bars, int beforeBar, float limit, bool wantBelow) =>
+    float v = na
+    int   b = na
+    int   n = vals.size()
+    if n > 0
+        for i = 0 to n - 1
+            float vi = vals.get(i)
+            int   bi = bars.get(i)
+            if bi < beforeBar and (wantBelow ? vi < limit : vi > limit)
+                v := vi
+                b := bi
+                break
+    [v, b]
+
+zoneHit(array<Zone> zones, float lo, float hi) =>
+    bool hit = false
+    for z in zones
+        if hi >= z.bot and lo <= z.top
+            hit := true
+            break
+    hit
+
+addZone(array<Zone> zones, float top, float bot, color col) =>
+    box bx = na
+    if showPoi
+        bx := box.new(bar_index, top, bar_index + 1, bot, border_color = color.new(col, 65), bgcolor = color.new(col, 90), extend = extend.right, text = tfName(poiTf) + " FVG", text_size = size.tiny, text_color = color.new(col, 30), text_halign = text.align_right)
+    zones.unshift(Zone.new(top, bot, bx))
+    if zones.size() > poiMax
+        Zone old = zones.pop()
+        if not na(old.bx)
+            old.bx.delete()
+
+// A bearish zone is invalidated by a close above it, a bullish zone by a close below it.
+pruneZones(array<Zone> zones, bool bearish) =>
+    int n = zones.size()
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = zones.get(i)
+            if bearish ? close > z.top : close < z.bot
+                if not na(z.bx)
+                    z.bx.delete()
+                zones.remove(i)
+
+method disarm(Setup s) =>
+    s.armed    := false
+    s.broken   := false
+    s.disp     := false
+    s.fvg      := false
+    s.poi      := false
+    s.mss      := na
+    s.mssBar   := na
+    s.breakBar := na
+    s.fvgTop   := na
+    s.fvgBot   := na
+    s.fvgBar   := na
+
+// Tracks excursions beyond `level`; returns true on the bar that confirms a sweep
+// (traded through the level, then closed back inside within `reclaimBars`).
+method trackSweep(Setup s, float level, bool above) =>
+    bool  through = above ? high > level : low < level
+    float ext     = above ? high : low
+    if through
+        if na(s.takeBar)
+            s.takeBar    := bar_index
+            s.takeExt    := ext
+            s.takeExtBar := bar_index
+        else if (above ? ext > s.takeExt : ext < s.takeExt)
+            s.takeExt    := ext
+            s.takeExtBar := bar_index
+    bool swept      = false
+    bool backInside = above ? close < level : close > level
+    if not na(s.takeBar) and backInside
+        float pen = above ? s.takeExt - level : level - s.takeExt
+        swept     := bar_index - s.takeBar <= reclaimBars and pen >= penAtr * atr
+        s.takeBar := na
+    swept
+
+method arm(Setup s, float level, bool bearish, array<float> swingVals, array<int> swingBars, array<Zone> zones) =>
+    s.disarm()
+    s.armed      := true
+    s.extreme    := s.takeExt
+    s.extremeBar := s.takeExtBar
+    s.sweepBar   := bar_index
+    [m, mb] = findSwing(swingVals, swingBars, s.extremeBar, level, bearish)
+    s.mss    := m
+    s.mssBar := mb
+    s.poi    := bearish ? zoneHit(zones, level, s.extreme) : zoneHit(zones, s.extreme, level)
+
+// Advances an armed setup by one bar. Returns true once sweep -> MSS -> displacement is complete.
+method advance(Setup s, float level, bool bearish) =>
+    bool ready = false
+    if s.armed
+        bool accepted = bearish ? close > s.extreme : close < s.extreme
+        bool expired  = not s.broken and bar_index - s.sweepBar > mssWindow
+        if accepted or expired
+            s.disarm()
+        else
+            // Displacement and FVG must print in the leg away from the sweep extreme.
+            if (bearish ? bearDisp : bullDisp) and bar_index >= s.extremeBar
+                s.disp := true
+            if (bearish ? bearFvgNow : bullFvgNow) and bar_index - 2 >= s.extremeBar
+                s.fvg    := true
+                s.fvgTop := bearish ? low2 : low
+                s.fvgBot := bearish ? high : high2
+                s.fvgBar := bar_index - 1
+            // Pivots confirm late: adopt a newer swing that formed before the extreme.
+            float piv    = bearish ? pivL : pivH
+            int   pivBar = bar_index - swingLen
+            if not s.broken and not na(piv) and pivBar < s.extremeBar and (bearish ? piv < level : piv > level) and (na(s.mssBar) or pivBar > s.mssBar)
+                s.mss    := piv
+                s.mssBar := pivBar
+            // Market structure shift.
+            if not s.broken and not na(s.mss) and (bearish ? close < s.mss : close > s.mss)
+                s.broken   := true
+                s.breakBar := bar_index
+            if s.broken
+                bool confOk = (not reqDisp or s.disp) and (not reqFvg or s.fvg)
+                if confOk and (bearish ? close < s.mss : close > s.mss)
+                    ready := true
+                else if bar_index - s.breakBar >= graceBars
+                    s.disarm()
+    ready
+
+// Trade plan for a confirmed setup, plus every reason it would be blocked.
+plan(Setup s, int dir) =>
+    bool  isShort = dir == -1
+    float entry   = close
+    float sl      = isShort ? s.extreme + slBufAtr * atr : s.extreme - slBufAtr * atr
+    float risk    = math.abs(entry - sl)
+    float tp2     = isShort ? pdl : pdh
+    bool  room    = isShort ? tp2 < entry : tp2 > entry
+    bool  eqAhead = isShort ? (pdEq < entry and pdEq > tp2) : (pdEq > entry and pdEq < tp2)
+    float tp1     = eqAhead ? pdEq : entry + dir * tp1FbR * risk
+    tp1 := isShort ? math.max(tp1, tp2) : math.min(tp1, tp2)
+    float rr1 = risk > 0 ? dir * (tp1 - entry) / risk : 0.0
+    float rr2 = risk > 0 ? dir * (tp2 - entry) / risk : 0.0
+    string why = ""
+    if isShort
+        why += biasShortOk ? "" : "• HTF bias is not bearish\n"
+        why += bullExpansion ? "• Bullish daily expansion (" + str.tostring(upRun) + " days)\n" : ""
+        why += pdShortOk ? "" : "• PDH is not in the premium of last week's range\n"
+    else
+        why += biasLongOk ? "" : "• HTF bias is not bullish\n"
+        why += bearExpansion ? "• Bearish daily expansion (" + str.tostring(dnRun) + " days)\n" : ""
+        why += pdLongOk ? "" : "• PDL is not in the discount of last week's range\n"
+    why += usePoi and not s.poi ? "• No HTF FVG at the sweep\n" : ""
+    why += inSess ? "" : "• Outside the session window\n"
+    why += onePerDay and not na(s.lastSigDay) and s.lastSigDay == dayId ? "• Already signalled this side today\n" : ""
+    why += room ? "" : "• Price is already beyond the opposite level\n"
+    why += room and useMinRR and rr1 < minRR ? "• R:R to TP1 " + str.tostring(rr1, "#.##") + " < " + str.tostring(minRR, "#.##") + "\n" : ""
+    [why == "", why, entry, sl, risk, tp1, tp2, rr1, rr2]
+
+method extendLines(Trade t) =>
+    if showTrades
+        t.lE.set_x2(bar_index)
+        t.lS.set_x2(bar_index)
+        t.lT1.set_x2(bar_index)
+        t.lT2.set_x2(bar_index)
+
+method closeTrade(Trade t, Stats s, float exitPx, string tag) =>
+    float rest = t.tp1Hit ? 1.0 - pPart : 1.0
+    float r    = t.realized + rest * t.dir * (exitPx - t.entry) / t.risk
+    s.netR := s.netR + r
+    switch tag
+        "SL"  => s.sl  := s.sl + 1
+        "BE"  => s.be  := s.be + 1
+        "TP2" => s.tp2 := s.tp2 + 1
+        "EOD" => s.eod := s.eod + 1
+    t.extendLines()
+    if showTrades
+        color c = r > 0.01 ? TP_COL : r < -0.01 ? SL_COL : color.gray
+        label.new(bar_index, exitPx, tag + " " + fmtR(r), style = label.style_label_left, color = color.new(c, 15), textcolor = color.white, size = size.tiny)
+    t.dir := 0
+
+method enter(Trade t, int dir, float entry, float sl, float risk, float tp1, float tp2) =>
+    t.dir      := dir
+    t.entry    := entry
+    t.sl       := sl
+    t.risk     := risk
+    t.tp1      := tp1
+    t.tp2      := tp2
+    t.tp1Hit   := false
+    t.realized := 0.0
+    t.start    := bar_index
+    if showTrades
+        t.lE  := line.new(bar_index, entry, bar_index + 1, entry, color = color.gray, width = 2)
+        t.lS  := line.new(bar_index, sl, bar_index + 1, sl, color = SL_COL, style = line.style_dashed)
+        t.lT1 := line.new(bar_index, tp1, bar_index + 1, tp1, color = TP_COL, style = line.style_dotted)
+        t.lT2 := line.new(bar_index, tp2, bar_index + 1, tp2, color = TP_COL, style = line.style_dashed, width = 2)
+
+// Conservative fill model: if the stop and a target print in the same bar, the stop wins.
+method manage(Trade t, Stats s) =>
+    bool isLong = t.dir == 1
+    bool hitSl  = isLong ? low <= t.sl : high >= t.sl
+    bool hitTp1 = not t.tp1Hit and (isLong ? high >= t.tp1 : low <= t.tp1)
+    bool hitTp2 = isLong ? high >= t.tp2 : low <= t.tp2
+    if hitSl
+        t.closeTrade(s, t.sl, t.tp1Hit and moveBe ? "BE" : "SL")
+    else
+        if hitTp1
+            t.tp1Hit   := true
+            t.realized := pPart * t.dir * (t.tp1 - t.entry) / t.risk
+            s.tp1      := s.tp1 + 1
+            if pPart >= 1.0
+                t.closeTrade(s, t.tp1, "TP1")
+            else
+                if showTrades
+                    label.new(bar_index, t.tp1, "TP1 ✓", style = label.style_label_left, color = color.new(TP_COL, 35), textcolor = color.white, size = size.tiny)
+                if moveBe
+                    t.sl := t.entry
+                    if showTrades
+                        t.lS.set_x2(bar_index)
+                        t.lS := line.new(bar_index, t.entry, bar_index + 1, t.entry, color = color.gray, style = line.style_dotted)
+        if t.dir != 0
+            if hitTp2
+                t.closeTrade(s, t.tp2, "TP2")
+            else
+                t.extendLines()
+
+setupTxt(Setup s) =>
+    s.armed ? (s.broken ? "MSS ✓ · awaiting displacement" : "swept · awaiting MSS") : "awaiting sweep"
+
+levelTag(label old, float y, string txt, color c) =>
+    if not na(old)
+        old.delete()
+    label.new(bar_index + 2, y, txt + " " + str.tostring(y, format.mintick), style = label.style_label_left, color = color.new(c, 85), textcolor = c, size = size.small)
+
+dashRow(table tb, int row, string k, string v, color vc) =>
+    table.cell(tb, 0, row, k, text_color = #b2b5be, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, row, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+// ─── State ────────────────────────────────────────────────────────────────────
+var Setup        bear          = Setup.new()
+var Setup        bull          = Setup.new()
+var Trade        pos           = Trade.new()
+var Stats        st            = Stats.new()
+var array<Zone>  bearZones     = array.new<Zone>()
+var array<Zone>  bullZones     = array.new<Zone>()
+var array<float> swingLows     = array.new<float>()
+var array<int>   swingLowBars  = array.new<int>()
+var array<float> swingHighs    = array.new<float>()
+var array<int>   swingHighBars = array.new<int>()
+
+// ─── Engine (bar close only) ──────────────────────────────────────────────────
+bool bearSweep   = false
+bool bullSweep   = false
+bool shortSignal = false
+bool longSignal  = false
+
+if tfOk and barstate.isconfirmed
+    // Confirmed swing points (pivot bar = bar_index - swingLen).
+    if not na(pivL)
+        swingLows.unshift(pivL)
+        swingLowBars.unshift(bar_index - swingLen)
+        if swingLows.size() > 50
+            swingLows.pop()
+            swingLowBars.pop()
+    if not na(pivH)
+        swingHighs.unshift(pivH)
+        swingHighBars.unshift(bar_index - swingLen)
+        if swingHighs.size() > 50
+            swingHighs.pop()
+            swingHighBars.pop()
+
+    // HTF fair value gaps formed by the last three completed POI candles.
+    if poiNewBar
+        if poiL3 > poiH1
+            addZone(bearZones, poiL3, poiH1, shortColor)
+        if poiH3 < poiL1
+            addZone(bullZones, poiL1, poiH3, longColor)
+    pruneZones(bearZones, true)
+    pruneZones(bullZones, false)
+
+    // New day: fresh levels, so reset intraday state and optionally flatten.
+    if newDay
+        bear.disarm()
+        bull.disarm()
+        bear.takeBar := na
+        bull.takeBar := na
+        if pos.dir != 0 and closeEod
+            pos.closeTrade(st, open, "EOD")
+
+    if pos.dir != 0 and bar_index > pos.start
+        pos.manage(st)
+
+    // Step 1 - liquidity sweep of PDH (buy-side) / PDL (sell-side).
+    bearSweep := bear.trackSweep(pdh, true)
+    bullSweep := bull.trackSweep(pdl, false)
+    if bearSweep
+        bear.arm(pdh, true, swingLows, swingLowBars, bearZones)
+    if bullSweep
+        bull.arm(pdl, false, swingHighs, swingHighBars, bullZones)
+
+    // Step 2 - MSS + displacement, then the context / risk filters.
+    if bear.advance(pdh, true)
+        [ok, why, e, sl, rk, t1, t2, r1, r2] = plan(bear, -1)
+        if ok and pos.dir == 0
+            shortSignal     := true
+            bear.lastSigDay := dayId
+            st.trades       := st.trades + 1
+            pos.enter(-1, e, sl, rk, t1, t2)
+            string tip = "SHORT · PDH sweep → MSS"
+            tip += bear.disp ? " + displacement" : ""
+            tip += bear.fvg ? " + FVG" : ""
+            tip += bear.poi ? " + HTF POI" : ""
+            tip += "\nEntry: " + str.tostring(e, format.mintick)
+            tip += "\nSL: " + str.tostring(sl, format.mintick)
+            tip += "\nTP1: " + str.tostring(t1, format.mintick) + " (" + fmtR(r1) + ", close " + str.tostring(partialPct) + "%)"
+            tip += "\nTP2: " + str.tostring(t2, format.mintick) + " (" + fmtR(r2) + ", PDL)"
+            label.new(bar_index, high, "SHORT", style = label.style_label_down, color = shortColor, textcolor = color.white, size = size.small, tooltip = tip)
+            if showMss and not na(bear.mssBar)
+                line.new(bear.mssBar, bear.mss, bar_index, bear.mss, color = shortColor, style = line.style_dotted)
+                label.new(math.round((bear.mssBar + bar_index) / 2.0), bear.mss, "MSS", style = label.style_none, textcolor = shortColor, size = size.tiny)
+            if showFvgBox and bear.fvg
+                box.new(bear.fvgBar - 1, bear.fvgTop, bar_index + 8, bear.fvgBot, border_color = color.new(shortColor, 60), bgcolor = color.new(shortColor, 82), text = "FVG", text_size = size.tiny, text_color = shortColor, text_halign = text.align_right)
+            alert("PDH/PDL Sweep SHORT " + syminfo.ticker + " (" + timeframe.period + ") | entry " + str.tostring(e, format.mintick) + " | SL " + str.tostring(sl, format.mintick) + " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick), alert.freq_once_per_bar_close)
+        else if not ok and showBlocked
+            label.new(bar_index, high, "✗", style = label.style_label_down, color = color.new(color.gray, 55), textcolor = color.white, size = size.tiny, tooltip = "Short setup blocked:\n" + why)
+        bear.disarm()
+
+    if bull.advance(pdl, false)
+        [ok, why, e, sl, rk, t1, t2, r1, r2] = plan(bull, 1)
+        if ok and pos.dir == 0
+            longSignal      := true
+            bull.lastSigDay := dayId
+            st.trades       := st.trades + 1
+            pos.enter(1, e, sl, rk, t1, t2)
+            string tip = "LONG · PDL sweep → MSS"
+            tip += bull.disp ? " + displacement" : ""
+            tip += bull.fvg ? " + FVG" : ""
+            tip += bull.poi ? " + HTF POI" : ""
+            tip += "\nEntry: " + str.tostring(e, format.mintick)
+            tip += "\nSL: " + str.tostring(sl, format.mintick)
+            tip += "\nTP1: " + str.tostring(t1, format.mintick) + " (" + fmtR(r1) + ", close " + str.tostring(partialPct) + "%)"
+            tip += "\nTP2: " + str.tostring(t2, format.mintick) + " (" + fmtR(r2) + ", PDH)"
+            label.new(bar_index, low, "LONG", style = label.style_label_up, color = longColor, textcolor = color.white, size = size.small, tooltip = tip)
+            if showMss and not na(bull.mssBar)
+                line.new(bull.mssBar, bull.mss, bar_index, bull.mss, color = longColor, style = line.style_dotted)
+                label.new(math.round((bull.mssBar + bar_index) / 2.0), bull.mss, "MSS", style = label.style_none, textcolor = longColor, size = size.tiny)
+            if showFvgBox and bull.fvg
+                box.new(bull.fvgBar - 1, bull.fvgTop, bar_index + 8, bull.fvgBot, border_color = color.new(longColor, 60), bgcolor = color.new(longColor, 82), text = "FVG", text_size = size.tiny, text_color = longColor, text_halign = text.align_right)
+            alert("PDH/PDL Sweep LONG " + syminfo.ticker + " (" + timeframe.period + ") | entry " + str.tostring(e, format.mintick) + " | SL " + str.tostring(sl, format.mintick) + " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick), alert.freq_once_per_bar_close)
+        else if not ok and showBlocked
+            label.new(bar_index, low, "✗", style = label.style_label_up, color = color.new(color.gray, 55), textcolor = color.white, size = size.tiny, tooltip = "Long setup blocked:\n" + why)
+        bull.disarm()
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+bool lvOn = tfOk and not newDay
+plot(showLevels and lvOn ? pdh : na, "PDH", pdhColor, 2, plot.style_linebr)
+plot(showLevels and lvOn ? pdl : na, "PDL", pdlColor, 2, plot.style_linebr)
+plot(showEq and lvOn ? pdEq : na, "EQ (50%)", color.new(eqColor, 20), 1, plot.style_linebr)
+plotshape(showSweeps and bearSweep, "PDH sweep (BSL)", shape.xcross, location.abovebar, shortColor, size = size.tiny, text = "BSL", textcolor = shortColor)
+plotshape(showSweeps and bullSweep, "PDL sweep (SSL)", shape.xcross, location.belowbar, longColor, size = size.tiny, text = "SSL", textcolor = longColor)
+
+var label tagPdh = na
+var label tagPdl = na
+var label tagEq  = na
+if barstate.islast and tfOk
+    if showLevels
+        tagPdh := levelTag(tagPdh, pdh, "PDH", pdhColor)
+        tagPdl := levelTag(tagPdl, pdl, "PDL", pdlColor)
+    if showEq
+        tagEq := levelTag(tagEq, pdEq, "EQ", eqColor)
+
+// ─── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(shortSignal, "Short signal", "PDH/PDL Sweep: SHORT - PDH swept, MSS + displacement confirmed on {{ticker}} ({{interval}})")
+alertcondition(longSignal, "Long signal", "PDH/PDL Sweep: LONG - PDL swept, MSS + displacement confirmed on {{ticker}} ({{interval}})")
+alertcondition(bearSweep, "PDH swept (BSL)", "PDH/PDL Sweep: previous day high swept and reclaimed on {{ticker}} ({{interval}})")
+alertcondition(bullSweep, "PDL swept (SSL)", "PDH/PDL Sweep: previous day low swept and reclaimed on {{ticker}} ({{interval}})")
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+string dashLoc = switch dashPos
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    => position.bottom_left
+
+var table dash = na
+if showDash and barstate.islast
+    if na(dash)
+        dash := table.new(dashLoc, 2, 12, bgcolor = color.new(#131722, 8), frame_color = color.new(#787b86, 50), frame_width = 1, border_color = color.new(#787b86, 80), border_width = 1)
+    int n = st.trades
+    string expTxt = bullExpansion ? "bull ×" + str.tostring(upRun) + " → no shorts" : bearExpansion ? "bear ×" + str.tostring(dnRun) + " → no longs" : "none (" + str.tostring(nz(upRun)) + "↑ / " + str.tostring(nz(dnRun)) + "↓)"
+    string posTxt = pos.dir == 0 ? "flat" : (pos.dir == 1 ? "LONG" : "SHORT") + (pos.tp1Hit ? " · TP1 ✓" : "")
+    dashRow(dash, 0, "PDH/PDL Sweep", tfOk ? timeframe.period + " · bar-close signals" : "⚠ use a chart below 1D", tfOk ? TXT_COL : color.orange)
+    dashRow(dash, 1, "Bias " + tfName(biasTf) + " EMA" + str.tostring(biasLen), useBias ? biasTxt(bias1) : "off", useBias ? biasCol(bias1) : TXT_COL)
+    dashRow(dash, 2, "Confluence " + tfName(bias2Tf) + " EMA" + str.tostring(bias2Len), useBias2 ? biasTxt(bias2) : "off", useBias2 ? biasCol(bias2) : TXT_COL)
+    dashRow(dash, 3, "Daily expansion", useExp ? expTxt : "off", bullExpansion ? longColor : bearExpansion ? shortColor : TXT_COL)
+    dashRow(dash, 4, "Shorts at PDH", shortsAllowed ? "allowed" : "blocked", shortsAllowed ? shortColor : color.gray)
+    dashRow(dash, 5, "Longs at PDL", longsAllowed ? "allowed" : "blocked", longsAllowed ? longColor : color.gray)
+    dashRow(dash, 6, "PDH setup", setupTxt(bear), bear.armed ? color.orange : TXT_COL)
+    dashRow(dash, 7, "PDL setup", setupTxt(bull), bull.armed ? color.orange : TXT_COL)
+    dashRow(dash, 8, "Position", posTxt, pos.dir == 1 ? longColor : pos.dir == -1 ? shortColor : TXT_COL)
+    dashRow(dash, 9, "Trades", str.tostring(n), TXT_COL)
+    dashRow(dash, 10, "TP1 / TP2 / SL", n > 0 ? pct(st.tp1, n) + " / " + pct(st.tp2, n) + " / " + pct(st.sl, n) : "–", TXT_COL)
+    dashRow(dash, 11, "Net R / avg", n > 0 ? fmtR(st.netR) + " / " + fmtR(st.netR / n) : "–", st.netR > 0 ? longColor : st.netR < 0 ? shortColor : TXT_COL)
