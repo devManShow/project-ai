@@ -1,0 +1,296 @@
+//@version=6
+indicator("Daily Sweep & FVG Strategy [5M/1H/4H]", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// -------------------------------------------------------------------------
+// INPUTS & SETTINGS
+// -------------------------------------------------------------------------
+grp_session = "Session & Timezone"
+ny_session  = input.session("0930-1600", "NY Session (Exchange Time)", group = grp_session)
+ny_tz       = input.string("America/New_York", "Time Zone", group = grp_session)
+
+grp_display = "Display Options"
+show_pd_levels = input.bool(true, "Show Previous Day High/Low", group = grp_display)
+show_fvg_boxes = input.bool(true, "Draw FVG Boxes", group = grp_display)
+show_trade_lines = input.bool(true, "Track Active Signal TP & SL Lines", group = grp_display)
+show_stats_tbl = input.bool(true, "Show Signal Accuracy Dashboard", group = grp_display)
+tbl_position   = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = grp_display)
+
+// -------------------------------------------------------------------------
+// TIMEFRAME VALIDATION
+// -------------------------------------------------------------------------
+is_5m  = timeframe.isminutes and timeframe.multiplier == 5
+is_1h  = timeframe.isminutes and timeframe.multiplier == 60
+is_4h  = timeframe.isminutes and timeframe.multiplier == 240
+is_allowed_tf = is_5m or is_1h or is_4h
+
+if not is_allowed_tf
+    runtime.error("This indicator is designed for 5m, 1h, and 4h timeframes only.")
+
+// -------------------------------------------------------------------------
+// DAILY BIAS & LEVELS (HIGHER TIMEFRAME ORDER FLOW)
+// -------------------------------------------------------------------------
+[d_high1, d_low1, d_high2, d_low2] = request.security(
+    syminfo.tickerid, 
+    "D", 
+    [high[1], low[1], high[2], low[2]], 
+    lookahead = barmerge.lookahead_on
+)
+
+pdh = d_high1
+pdl = d_low1
+
+// Daily Trend Definition: HH/HL = Bullish, LH/LL = Bearish
+daily_bullish = d_high1 > d_high2 and d_low1 > d_low2
+daily_bearish = d_high1 < d_high2 and d_low1 < d_low2
+
+// -------------------------------------------------------------------------
+// DRAW PREVIOUS DAY LEVELS (PDH / PDL)
+// -------------------------------------------------------------------------
+var line pdh_line = na
+var line pdl_line = na
+var label pdh_lbl  = na
+var label pdl_lbl  = na
+
+is_new_day = ta.change(time("D")) != 0
+
+if is_new_day and show_pd_levels
+    line.delete(pdh_line)
+    line.delete(pdl_line)
+    label.delete(pdh_lbl)
+    label.delete(pdl_lbl)
+
+    pdh_line := line.new(bar_index, pdh, bar_index + 10, pdh, color = color.teal, width = 1, style = line.style_dashed, extend = extend.right)
+    pdl_line := line.new(bar_index, pdl, bar_index + 10, pdl, color = color.maroon, width = 1, style = line.style_dashed, extend = extend.right)
+
+    pdh_lbl := label.new(bar_index, pdh, "PDH Target", color = color.new(color.teal, 80), textcolor = color.teal, style = label.style_label_down, size = size.small)
+    pdl_lbl := label.new(bar_index, pdl, "PDL Target", color = color.new(color.maroon, 80), textcolor = color.maroon, style = label.style_label_up, size = size.small)
+
+// -------------------------------------------------------------------------
+// 5-MINUTE EXECUTION ENGINE: SWEEP + FVG + RETEST
+// -------------------------------------------------------------------------
+in_ny_session = not na(time(timeframe.period, ny_session, ny_tz))
+
+swing_len  = 10
+swing_low  = ta.lowest(low, swing_len)[1]
+swing_high = ta.highest(high, swing_len)[1]
+
+var bool  swept_low       = false
+var bool  swept_high      = false
+var float sweep_low_val  = na
+var float sweep_high_val = na
+
+if not in_ny_session
+    swept_low      := false
+    swept_high     := false
+    sweep_low_val  := na
+    sweep_high_val := na
+
+if is_5m and in_ny_session
+    if daily_bullish and not swept_low and (low < swing_low)
+        swept_low     := true
+        sweep_low_val := low
+
+    if daily_bearish and not swept_high and (high > swing_high)
+        swept_high     := true
+        sweep_high_val := high
+
+    if swept_low and low < sweep_low_val
+        sweep_low_val := low
+    if swept_high and high > sweep_high_val
+        sweep_high_val := high
+
+// -------------------------------------------------------------------------
+// FAIR VALUE GAP (FVG) DETECTION
+// -------------------------------------------------------------------------
+is_bull_fvg = is_5m and (low > high[2]) and (close[1] > open[1])
+is_bear_fvg = is_5m and (high < low[2]) and (close[1] < open[1])
+
+var float bull_fvg_top = na
+var float bull_fvg_bot = na
+var float bear_fvg_top = na
+var float bear_fvg_bot = na
+
+var bool waiting_for_bull_retest = false
+var bool waiting_for_bear_retest = false
+
+if is_5m and in_ny_session
+    if swept_low and is_bull_fvg and not waiting_for_bull_retest
+        bull_fvg_top := low
+        bull_fvg_bot := high[2]
+        waiting_for_bull_retest := true
+        
+        if show_fvg_boxes
+            box.new(left = bar_index - 2, top = bull_fvg_top, right = bar_index + 12, bottom = bull_fvg_bot, 
+                    border_color = color.green, bgcolor = color.new(color.green, 85), 
+                    text = "FVG", text_color = color.green, text_size = size.small)
+
+    if swept_high and is_bear_fvg and not waiting_for_bear_retest
+        bear_fvg_top := low[2]
+        bear_fvg_bot := high
+        waiting_for_bear_retest := true
+        
+        if show_fvg_boxes
+            box.new(left = bar_index - 2, top = bear_fvg_top, right = bar_index + 12, bottom = bear_fvg_bot, 
+                    border_color = color.red, bgcolor = color.new(color.red, 85), 
+                    text = "FVG", text_color = color.red, text_size = size.small)
+
+// -------------------------------------------------------------------------
+// RETEST ENTRY TRIGGER (ONLY ON 5M)
+// -------------------------------------------------------------------------
+bull_entry_signal = false
+bear_entry_signal = false
+
+if is_5m and in_ny_session
+    if waiting_for_bull_retest and not na(bull_fvg_top)
+        if low <= bull_fvg_top and high >= bull_fvg_bot
+            bull_entry_signal       := true
+            waiting_for_bull_retest := false
+            swept_low               := false
+
+    if waiting_for_bear_retest and not na(bear_fvg_top)
+        if high >= bear_fvg_bot and low <= bear_fvg_top
+            bear_entry_signal       := true
+            waiting_for_bear_retest := false
+            swept_high              := false
+
+if waiting_for_bull_retest and low < sweep_low_val
+    waiting_for_bull_retest := false
+    swept_low               := false
+
+if waiting_for_bear_retest and high > sweep_high_val
+    waiting_for_bear_retest := false
+    swept_high              := false
+
+// -------------------------------------------------------------------------
+// PLOT SIGNALS (5M ONLY)
+// -------------------------------------------------------------------------
+plotshape(bull_entry_signal, title = "Buy Signal", location = location.belowbar, color = color.green, style = shape.triangleup, size = size.normal, text = "BUY")
+plotshape(bear_entry_signal, title = "Sell Signal", location = location.abovebar, color = color.red, style = shape.triangledown, size = size.normal, text = "SELL")
+
+// -------------------------------------------------------------------------
+// ACTIVE SIGNAL TRACKING (TP & SL LEVELS)
+// -------------------------------------------------------------------------
+var int   total_signals = 0
+var int   wins          = 0
+var int   losses        = 0
+
+var int   active_dir    = 0     // 1 for Long, -1 for Short, 0 for None
+var float active_entry  = na
+var float active_sl     = na
+var float active_tp     = na
+
+var line  line_active_tp = na
+var line  line_active_sl = na
+var label lbl_active_tp  = na
+var label lbl_active_sl  = na
+
+if is_5m
+    // Start Long Trade Tracking
+    if bull_entry_signal and active_dir == 0
+        active_dir    := 1
+        active_entry  := close
+        active_sl     := sweep_low_val
+        active_tp     := pdh
+        total_signals += 1
+
+        if show_trade_lines
+            line_active_tp := line.new(bar_index, active_tp, bar_index + 1, active_tp, color = color.green, width = 2)
+            line_active_sl := line.new(bar_index, active_sl, bar_index + 1, active_sl, color = color.red, width = 2)
+            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
+            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
+
+    // Start Short Trade Tracking
+    if bear_entry_signal and active_dir == 0
+        active_dir    := -1
+        active_entry  := close
+        active_sl     := sweep_high_val
+        active_tp     := pdl
+        total_signals += 1
+
+        if show_trade_lines
+            line_active_tp := line.new(bar_index, active_tp, bar_index + 1, active_tp, color = color.green, width = 2)
+            line_active_sl := line.new(bar_index, active_sl, bar_index + 1, active_sl, color = color.red, width = 2)
+            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
+            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
+
+    // Extend lines and labels while trade is active
+    if active_dir != 0 and show_trade_lines
+        if not na(line_active_tp)
+            line.set_x2(line_active_tp, bar_index)
+            label.set_x(lbl_active_tp, bar_index)
+        if not na(line_active_sl)
+            line.set_x2(line_active_sl, bar_index)
+            label.set_x(lbl_active_sl, bar_index)
+
+    // Check Long Exit Conditions
+    if active_dir == 1
+        if high >= active_tp
+            wins       += 1
+            active_dir := 0
+        else if low <= active_sl
+            losses     += 1
+            active_dir := 0
+
+    // Check Short Exit Conditions
+    if active_dir == -1
+        if low <= active_tp
+            wins       += 1
+            active_dir := 0
+        else if high >= active_sl
+            losses     += 1
+            active_dir := 0
+
+// Calculate win rate
+resolved_trades = wins + losses
+winrate = resolved_trades > 0 ? (wins / resolved_trades) * 100.0 : 0.0
+
+// -------------------------------------------------------------------------
+// ON-CHART DASHBOARD TABLE
+// -------------------------------------------------------------------------
+var table info_table = na
+
+table_pos = switch tbl_position
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+if is_5m and show_stats_tbl and barstate.islast
+    info_table := table.new(table_pos, 2, 8, bgcolor = color.new(color.black, 20), border_color = color.gray, border_width = 1)
+
+    // Strategy Metrics Header
+    table.cell(info_table, 0, 0, "Daily Sweep Stats", bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 0, "5M Metric",         bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 1, "Total Signals",    text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 1, str.tostring(total_signals), text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 2, "Wins (TP Hit)",     text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 2, str.tostring(wins),  text_color = color.green, text_size = size.small)
+
+    table.cell(info_table, 0, 3, "Losses (SL Hit)",   text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 3, str.tostring(losses),text_color = color.red,   text_size = size.small)
+
+    winrate_color = winrate >= 50.0 ? color.green : color.orange
+    table.cell(info_table, 0, 4, "Win Rate",          bgcolor = color.new(color.navy, 30), text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 4, str.tostring(winrate, "#.##") + "%", bgcolor = color.new(color.navy, 30), text_color = winrate_color, text_size = size.small)
+
+    // Active Signal Status & Exact Price Levels
+    status_text  = active_dir == 1 ? "LONG ACTIVE" : active_dir == -1 ? "SHORT ACTIVE" : "WAITING SETUP"
+    status_color = active_dir == 1 ? color.green : active_dir == -1 ? color.maroon : color.gray
+
+    table.cell(info_table, 0, 5, "Trade Status", bgcolor = status_color, text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 5, status_text,    bgcolor = status_color, text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 6, "Active Target (TP)", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 6, active_dir != 0 ? str.tostring(active_tp, "#.##") : "-", text_color = color.green, text_size = size.small)
+
+    table.cell(info_table, 0, 7, "Active Stop (SL)", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 7, active_dir != 0 ? str.tostring(active_sl, "#.##") : "-", text_color = color.red, text_size = size.small)
+
+// -------------------------------------------------------------------------
+// ALERTS
+// -------------------------------------------------------------------------
+alertcondition(bull_entry_signal, title = "Daily Sweep: Long Entry", message = "Daily Sweep Bullish Entry: 5M FVG retest confirmed. Target: PDH")
+alertcondition(bear_entry_signal, title = "Daily Sweep: Short Entry", message = "Daily Sweep Bearish Entry: 5M FVG retest confirmed. Target: PDL")
