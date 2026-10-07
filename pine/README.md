@@ -26,7 +26,7 @@ Everything runs on closed bars, so a signal never appears and then vanishes. The
 
 ## Installing
 
-1. Open the file and copy **all** of it. The indicator is about 400 lines; the last lines are the `alert(...)` call.
+1. Open the file and copy **all** of it. The indicator is 432 lines and the strategy is 474. Both end with an `alert(...)` call.
 2. In TradingView open Pine Editor → *Open* → *New blank indicator* (use *New blank strategy* for the strategy file). Select all of the template text, then paste over it.
 3. Click **Add to chart** and use a **5 minute** chart.
 
@@ -36,11 +36,16 @@ If the editor shows *"The script must have at least one output function call" (C
 
 No settings can guarantee profit. Test it like this:
 
-1. Add `daily_sweep_fvg_strategy.pine` to a 5m chart of the market you trade.
-2. In *Properties*, set **commission and slippage to match your broker**. For futures, also set *Max Leverage* to `0` and use *Fixed Quantity* contracts.
+1. Add `daily_sweep_fvg_strategy.pine` to a 5m chart of the market you trade, using a normal candle chart (Heikin Ashi and Renko are refused because their prices are synthetic).
+2. In *Properties*, set **commission and slippage to match your broker**. The default is 0.01% per side plus 1 tick, which fits stocks. For futures, switch to a fee *per contract* (about 2–3 USD) and set the script's *Commission per Side (%)* input to 0. For crypto, use 0.05–0.1%. Margin checks are off. *Max Leverage* caps position size for stocks, forex and crypto and is ignored for futures. Size futures with *Risk %* or *Fixed Quantity*.
 3. In *Strategy Tester*, start with **net profit, profit factor, max drawdown, and the number of trades**. Win rate alone means little: a 40% win rate at 2R per win makes money, while a 70% win rate at 0.3R per win loses.
-4. **Avoid curve fitting.** Tune the inputs on the older half of the history only. Then check, without changing anything, that the newer half still makes money. If it only works on the data it was tuned on, it doesn't work.
-5. Fewer than about 100 trades is too few to tell skill from luck.
+4. The dashboard's R figures subtract the *Round-Trip Slippage* and *Commission* inputs. They use the same fill rules as the Strategy Tester:
+   * a bar that opens beyond a level fills at the open
+   * a bar that touches both stop and target goes to whichever extreme is nearer the open first
+
+   For a stricter test, enable *Verify price for limit orders* (1–2 ticks) in Properties, so a target only fills if price trades through it. On Premium plans, also enable *Bar Magnifier*.
+5. **Avoid curve fitting.** Tune the inputs on the older half of the history only. Then check, without changing anything, that the newer half still makes money. If it only works on the data it was tuned on, it doesn't work.
+6. Fewer than about 100 trades is too few to tell skill from luck.
 
 ## Inputs worth testing first
 

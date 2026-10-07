@@ -15,14 +15,14 @@ indicator("Daily Sweep & FVG Strategy [5M/1H/4H]", shorttitle = "Sweep+FVG", ove
 grp_session  = "Session & Timezone"
 ny_session   = input.session("0930-1600", "NY Session", group = grp_session, tooltip = "Setups are only built inside this session (format HHMM-HHMM, in the time zone below).")
 entry_window = input.session("0930-1200", "Entry Window", group = grp_session, tooltip = "New trades are only opened inside this window. Late-day entries rarely reach PDH/PDL before the close.")
-ny_tz        = input.string("America/New_York", "Time Zone", group = grp_session)
+ny_tz        = input.string("America/New_York", "Time Zone", options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "UTC"], group = grp_session)
 close_eod    = input.bool(true, "Close Open Trade at Session End", group = grp_session)
 
 grp_setup   = "Setup Rules"
 bias_mode   = input.string("Daily HH/HL", "Daily Bias Filter", options = ["Daily HH/HL", "Off"], group = grp_setup, tooltip = "Daily HH/HL: longs only after a higher-high + higher-low day, shorts only after a lower-high + lower-low day. Off: both directions.")
 swing_len   = input.int(10, "Sweep Lookback (bars)", minval = 2, group = grp_setup, tooltip = "A sweep is a break of the lowest low / highest high of this many prior bars.")
 min_fvg_atr = input.float(0.1, "Min FVG Size (x ATR)", minval = 0.0, step = 0.05, group = grp_setup, tooltip = "Ignore gaps smaller than this fraction of ATR(14). 0 = any size.")
-fvg_expiry  = input.int(12, "FVG Expiry (bars)", minval = 0, group = grp_setup, tooltip = "Cancel the setup if the FVG is not retested within this many bars. 0 = never expire.")
+fvg_expiry  = input.int(12, "FVG Expiry (bars)", minval = 0, maxval = 500, group = grp_setup, tooltip = "Cancel the setup if the FVG is not retested within this many bars. 0 = never expire.")
 need_hold   = input.bool(true, "Retest Bar Must Hold the FVG", group = grp_setup, tooltip = "Long: the retest bar must close above the FVG bottom. Short: it must close below the FVG top.")
 
 grp_risk     = "Risk & Targets"
@@ -31,6 +31,8 @@ fixed_rr     = input.float(2.0, "Fixed R Multiple", minval = 0.5, step = 0.25, g
 min_rr       = input.float(1.5, "Min Reward:Risk", minval = 0.0, step = 0.25, group = grp_risk, tooltip = "Skip signals whose target pays less than this multiple of the risk.")
 stop_buf_atr = input.float(0.05, "Stop Buffer (x ATR)", minval = 0.0, step = 0.05, group = grp_risk, tooltip = "Place the stop this fraction of ATR(14) beyond the sweep extreme.")
 max_trades   = input.int(2, "Max Trades per Day", minval = 1, group = grp_risk)
+cost_ticks   = input.float(2.0, "Round-Trip Slippage (ticks)", minval = 0.0, step = 0.5, group = grp_risk, tooltip = "Entry + exit slippage/spread per trade, in ticks. Deducted from every trade's R on the dashboard.")
+cost_pct     = input.float(0.0, "Commission per Side (%)", minval = 0.0, step = 0.005, group = grp_risk, tooltip = "Percentage fee per side (stocks/crypto), deducted from every trade's R. For per-contract futures fees, add them to the slippage ticks instead.")
 
 grp_display      = "Display Options"
 show_pd_levels   = input.bool(true, "Show Previous Day High/Low", group = grp_display)
@@ -50,6 +52,10 @@ is_allowed_tf = is_5m or is_1h or is_4h
 
 if not is_allowed_tf
     runtime.error("This indicator is designed for 5m, 1h, and 4h timeframes only.")
+
+// Heikin Ashi / Renko / etc. prices never traded: sweeps, FVGs and fills would be fiction
+if not chart.is_standard
+    runtime.error("Use a standard candle or bar chart. Heikin Ashi, Renko, Kagi, Line Break and Point & Figure prices are synthetic.")
 
 // -------------------------------------------------------------------------
 // DAILY BIAS & LEVELS (HIGHER TIMEFRAME ORDER FLOW)
@@ -75,11 +81,14 @@ is_new_day    = timeframe.change("D")
 in_ny_session = not na(time(timeframe.period, ny_session, ny_tz))
 in_entry_win  = not na(time(timeframe.period, entry_window, ny_tz))
 
-// Last bar of the session: its close time reaches the session end (HHMM after the '-')
+// Last bar of the session: its close time reaches the session end (HHMM after the '-').
+// Sessions that end at/after midnight fall back to the symbol's regular-session close.
+sess_start_m  = int(str.tonumber(str.substring(ny_session, 0, 2))) * 60 + int(str.tonumber(str.substring(ny_session, 2, 4)))
 sess_end_h    = int(str.tonumber(str.substring(ny_session, 5, 7)))
 sess_end_m    = int(str.tonumber(str.substring(ny_session, 7, 9)))
+sess_wraps    = sess_end_h * 60 + sess_end_m <= sess_start_m
 sess_end_ts   = timestamp(ny_tz, year(time, ny_tz), month(time, ny_tz), dayofmonth(time, ny_tz), sess_end_h, sess_end_m)
-last_sess_bar = in_ny_session and ((not na(sess_end_ts) and time_close >= sess_end_ts) or session.islastbar_regular)
+last_sess_bar = in_ny_session and ((not sess_wraps and not na(sess_end_ts) and time_close >= sess_end_ts) or session.islastbar_regular)
 
 // -------------------------------------------------------------------------
 // PREVIOUS DAY LEVELS (PDH / PDL) & DAILY BIAS BACKGROUND
@@ -159,7 +168,9 @@ if is_new_day
 // ACTIVE TRADE MANAGEMENT
 // Runs before new signals, so a trade is never resolved on its own entry bar
 // and a new trade may start on the bar where the previous one exits.
-// If one bar touches both levels, the stop is assumed to have been hit first.
+// Fill rules match TradingView's Strategy Tester: a bar that opens beyond a
+// level fills at the open; if one bar touches both levels, the path is
+// open -> nearer extreme -> other extreme -> close.
 // -------------------------------------------------------------------------
 float exit_r = na
 
@@ -175,22 +186,37 @@ if run and active_dir != 0
     trade_risk = math.abs(active_entry - active_sl)
     float exit_px = na
 
+    high_first = (high - open) < (open - low)
+
     if active_dir == 1
-        if low <= active_sl
-            exit_px := math.min(open, active_sl)
-        else if high >= active_tp
-            exit_px := math.max(open, active_tp)
+        hit_sl = low <= active_sl
+        hit_tp = high >= active_tp
+        if open <= active_sl or open >= active_tp
+            exit_px := open
+        else if hit_sl and hit_tp
+            exit_px := high_first ? active_tp : active_sl
+        else if hit_sl
+            exit_px := active_sl
+        else if hit_tp
+            exit_px := active_tp
     else
-        if high >= active_sl
-            exit_px := math.max(open, active_sl)
-        else if low <= active_tp
-            exit_px := math.min(open, active_tp)
+        hit_sl = high >= active_sl
+        hit_tp = low <= active_tp
+        if open >= active_sl or open <= active_tp
+            exit_px := open
+        else if hit_sl and hit_tp
+            exit_px := high_first ? active_sl : active_tp
+        else if hit_sl
+            exit_px := active_sl
+        else if hit_tp
+            exit_px := active_tp
 
     if na(exit_px) and close_eod and (last_sess_bar or not in_ny_session or is_new_day)
         exit_px := close
 
     if not na(exit_px)
-        exit_r := active_dir * (exit_px - active_entry) / trade_risk
+        trade_cost = cost_ticks * syminfo.mintick + cost_pct / 100 * (active_entry + exit_px)
+        exit_r    := (active_dir * (exit_px - active_entry) - trade_cost) / trade_risk
         net_r  += exit_r
         if exit_r > 0
             wins        += 1
@@ -208,6 +234,17 @@ if run and active_dir != 0
 // 5-MINUTE EXECUTION ENGINE: SWEEP + FVG + RETEST
 // -------------------------------------------------------------------------
 if run and in_ny_session
+    // Invalidate first: a break of the sweep extreme, or an unfilled FVG that has
+    // gone stale, kills the setup. Running this before sweep detection lets the
+    // bar that broke the old extreme register as a fresh (deeper) sweep.
+    if waiting_for_bull_retest and (low < sweep_low_val or (fvg_expiry > 0 and bar_index - bull_fvg_bar > fvg_expiry))
+        waiting_for_bull_retest := false
+        swept_low               := false
+
+    if waiting_for_bear_retest and (high > sweep_high_val or (fvg_expiry > 0 and bar_index - bear_fvg_bar > fvg_expiry))
+        waiting_for_bear_retest := false
+        swept_high              := false
+
     if allow_long and not swept_low and low < swing_low
         swept_low     := true
         sweep_low_val := low
@@ -263,26 +300,18 @@ float sig_tp = na
 can_enter = in_entry_win and not last_sess_bar and active_dir == 0 and trades_today < max_trades
 
 if run and in_ny_session
-    // Invalidate first: a break of the sweep extreme, or an unfilled FVG that
-    // has gone stale, kills the setup
-    if waiting_for_bull_retest and (low < sweep_low_val or (fvg_expiry > 0 and bar_index - bull_fvg_bar > fvg_expiry))
-        waiting_for_bull_retest := false
-        swept_low               := false
-
-    if waiting_for_bear_retest and (high > sweep_high_val or (fvg_expiry > 0 and bar_index - bear_fvg_bar > fvg_expiry))
-        waiting_for_bear_retest := false
-        swept_high              := false
-
     // The retest must come after the FVG candle (which always touches its own gap).
     // A retest consumes the setup whether or not it passes the trade filters.
     if waiting_for_bull_retest and bar_index > bull_fvg_bar and low <= bull_fvg_top and high >= bull_fvg_bot
         waiting_for_bull_retest := false
         swept_low               := false
 
-        long_sl   = sweep_low_val - stop_buf_atr * atr
+        // Stop at least 1 tick beyond the sweep extreme; prices kept on the tick grid
+        long_sl   = math.round_to_mintick(sweep_low_val - math.max(stop_buf_atr * atr, syminfo.mintick))
         long_risk = close - long_sl
-        long_tp   = target_mode == "PDH / PDL" ? pdh : close + fixed_rr * long_risk
-        long_ok   = not na(long_sl) and not na(long_tp) and long_risk > 0 and long_tp > close and (long_tp - close) / long_risk >= min_rr and (not need_hold or close >= bull_fvg_bot)
+        long_tp   = target_mode == "PDH / PDL" ? pdh : math.round_to_mintick(close + fixed_rr * long_risk)
+        long_rr   = target_mode == "Fixed R" ? fixed_rr : (long_tp - close) / long_risk
+        long_ok   = not na(long_sl) and not na(long_tp) and long_risk > 0 and long_tp > close and long_rr >= min_rr and (not need_hold or close >= bull_fvg_bot)
 
         if can_enter and long_ok
             bull_entry_signal := true
@@ -293,10 +322,11 @@ if run and in_ny_session
         waiting_for_bear_retest := false
         swept_high              := false
 
-        short_sl   = sweep_high_val + stop_buf_atr * atr
+        short_sl   = math.round_to_mintick(sweep_high_val + math.max(stop_buf_atr * atr, syminfo.mintick))
         short_risk = short_sl - close
-        short_tp   = target_mode == "PDH / PDL" ? pdl : close - fixed_rr * short_risk
-        short_ok   = not na(short_sl) and not na(short_tp) and short_risk > 0 and short_tp < close and (close - short_tp) / short_risk >= min_rr and (not need_hold or close <= bear_fvg_top)
+        short_tp   = target_mode == "PDH / PDL" ? pdl : math.round_to_mintick(close - fixed_rr * short_risk)
+        short_rr   = target_mode == "Fixed R" ? fixed_rr : (close - short_tp) / short_risk
+        short_ok   = not na(short_sl) and not na(short_tp) and short_risk > 0 and short_tp < close and short_rr >= min_rr and (not need_hold or close <= bear_fvg_top)
 
         if can_enter and short_ok and not bull_entry_signal
             bear_entry_signal := true
