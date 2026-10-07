@@ -1,0 +1,432 @@
+//@version=6
+indicator("Daily Sweep & FVG Strategy [5M/1H/4H]", shorttitle = "Sweep+FVG", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// =========================================================================
+// SYSTEM
+// Daily bias (prior day HH/HL or LH/LL) -> NY-session liquidity sweep on 5m
+// -> displacement FVG -> first retest of the FVG = entry.
+// Stop beyond the sweep extreme, target PDH (long) / PDL (short) or fixed R.
+// Signals and stats are evaluated on closed bars only (no repainting).
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// INPUTS & SETTINGS
+// -------------------------------------------------------------------------
+grp_session  = "Session & Timezone"
+ny_session   = input.session("0930-1600", "NY Session", group = grp_session, tooltip = "Setups are only built inside this session (format HHMM-HHMM, in the time zone below).")
+entry_window = input.session("0930-1200", "Entry Window", group = grp_session, tooltip = "New trades are only opened inside this window. Late-day entries rarely reach PDH/PDL before the close.")
+ny_tz        = input.string("America/New_York", "Time Zone", options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "UTC"], group = grp_session)
+close_eod    = input.bool(true, "Close Open Trade at Session End", group = grp_session)
+
+grp_setup   = "Setup Rules"
+bias_mode   = input.string("Daily HH/HL", "Daily Bias Filter", options = ["Daily HH/HL", "Off"], group = grp_setup, tooltip = "Daily HH/HL: longs only after a higher-high + higher-low day, shorts only after a lower-high + lower-low day. Off: both directions.")
+swing_len   = input.int(10, "Sweep Lookback (bars)", minval = 2, group = grp_setup, tooltip = "A sweep is a break of the lowest low / highest high of this many prior bars.")
+min_fvg_atr = input.float(0.1, "Min FVG Size (x ATR)", minval = 0.0, step = 0.05, group = grp_setup, tooltip = "Ignore gaps smaller than this fraction of ATR(14). 0 = any size.")
+fvg_expiry  = input.int(12, "FVG Expiry (bars)", minval = 0, maxval = 500, group = grp_setup, tooltip = "Cancel the setup if the FVG is not retested within this many bars. 0 = never expire.")
+need_hold   = input.bool(true, "Retest Bar Must Hold the FVG", group = grp_setup, tooltip = "Long: the retest bar must close above the FVG bottom. Short: it must close below the FVG top.")
+
+grp_risk     = "Risk & Targets"
+target_mode  = input.string("PDH / PDL", "Take Profit", options = ["PDH / PDL", "Fixed R"], group = grp_risk)
+fixed_rr     = input.float(2.0, "Fixed R Multiple", minval = 0.5, step = 0.25, group = grp_risk, tooltip = "Target distance in multiples of the risk. Used when Take Profit = Fixed R.")
+min_rr       = input.float(1.5, "Min Reward:Risk", minval = 0.0, step = 0.25, group = grp_risk, tooltip = "Skip signals whose target pays less than this multiple of the risk.")
+stop_buf_atr = input.float(0.05, "Stop Buffer (x ATR)", minval = 0.0, step = 0.05, group = grp_risk, tooltip = "Place the stop this fraction of ATR(14) beyond the sweep extreme.")
+max_trades   = input.int(2, "Max Trades per Day", minval = 1, group = grp_risk)
+cost_ticks   = input.float(2.0, "Round-Trip Slippage (ticks)", minval = 0.0, step = 0.5, group = grp_risk, tooltip = "Entry + exit slippage/spread per trade, in ticks. Deducted from every trade's R on the dashboard.")
+cost_pct     = input.float(0.0, "Commission per Side (%)", minval = 0.0, step = 0.005, group = grp_risk, tooltip = "Percentage fee per side (stocks/crypto), deducted from every trade's R. For per-contract futures fees, add them to the slippage ticks instead.")
+
+grp_display      = "Display Options"
+show_pd_levels   = input.bool(true, "Show Previous Day High/Low", group = grp_display)
+show_bias_bg     = input.bool(true, "Tint Background by Daily Bias", group = grp_display)
+show_fvg_boxes   = input.bool(true, "Draw FVG Boxes", group = grp_display)
+show_trade_lines = input.bool(true, "Track Active Signal TP & SL Lines", group = grp_display)
+show_stats_tbl   = input.bool(true, "Show Performance Dashboard", group = grp_display)
+tbl_position     = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = grp_display)
+
+// -------------------------------------------------------------------------
+// TIMEFRAME VALIDATION
+// -------------------------------------------------------------------------
+is_5m  = timeframe.isminutes and timeframe.multiplier == 5
+is_1h  = timeframe.isminutes and timeframe.multiplier == 60
+is_4h  = timeframe.isminutes and timeframe.multiplier == 240
+is_allowed_tf = is_5m or is_1h or is_4h
+
+if not is_allowed_tf
+    runtime.error("This indicator is designed for 5m, 1h, and 4h timeframes only.")
+
+// Heikin Ashi / Renko / etc. prices never traded: sweeps, FVGs and fills would be fiction
+if not chart.is_standard
+    runtime.error("Use a standard candle or bar chart. Heikin Ashi, Renko, Kagi, Line Break and Point & Figure prices are synthetic.")
+
+// -------------------------------------------------------------------------
+// DAILY BIAS & LEVELS (HIGHER TIMEFRAME ORDER FLOW)
+// -------------------------------------------------------------------------
+// [1]/[2] offsets with lookahead_on = completed prior days only (non-repainting)
+[d_high1, d_low1, d_high2, d_low2] = request.security(syminfo.tickerid, "D", [high[1], low[1], high[2], low[2]], lookahead = barmerge.lookahead_on)
+
+pdh = d_high1
+pdl = d_low1
+
+// Daily Trend Definition: HH/HL = Bullish, LH/LL = Bearish
+daily_bullish = d_high1 > d_high2 and d_low1 > d_low2
+daily_bearish = d_high1 < d_high2 and d_low1 < d_low2
+
+use_bias    = bias_mode == "Daily HH/HL"
+allow_long  = use_bias ? daily_bullish : true
+allow_short = use_bias ? daily_bearish : true
+
+// -------------------------------------------------------------------------
+// SESSION CLOCK
+// -------------------------------------------------------------------------
+is_new_day    = timeframe.change("D")
+in_ny_session = not na(time(timeframe.period, ny_session, ny_tz))
+in_entry_win  = not na(time(timeframe.period, entry_window, ny_tz))
+
+// Last bar of the session: the bar whose open->close spans the session end time of
+// day (midnight-safe, so overnight and "-0000" sessions work), or the symbol's
+// regular-session close (early-close days).
+sess_end_tod  = int(str.tonumber(str.substring(ny_session, 5, 7))) * 60 + int(str.tonumber(str.substring(ny_session, 7, 9)))
+bar_open_tod  = hour(time, ny_tz) * 60 + minute(time, ny_tz)
+bar_close_tod = hour(time_close, ny_tz) * 60 + minute(time_close, ny_tz)
+spans_end     = bar_open_tod < bar_close_tod ? (bar_open_tod < sess_end_tod and bar_close_tod >= sess_end_tod) : (bar_open_tod < sess_end_tod or bar_close_tod >= sess_end_tod)
+last_sess_bar = in_ny_session and (spans_end or session.islastbar_regular)
+
+// -------------------------------------------------------------------------
+// PREVIOUS DAY LEVELS (PDH / PDL) & DAILY BIAS BACKGROUND
+// -------------------------------------------------------------------------
+plot(show_pd_levels and not is_new_day ? pdh : na, title = "PDH", color = color.teal, linewidth = 1, style = plot.style_linebr)
+plot(show_pd_levels and not is_new_day ? pdl : na, title = "PDL", color = color.maroon, linewidth = 1, style = plot.style_linebr)
+
+bias_bg = daily_bullish ? color.new(color.teal, 93) : daily_bearish ? color.new(color.maroon, 93) : na
+bgcolor(show_bias_bg ? bias_bg : na, title = "Daily Bias")
+
+var label pdh_lbl = na
+var label pdl_lbl = na
+
+if is_new_day and show_pd_levels
+    label.delete(pdh_lbl)
+    label.delete(pdl_lbl)
+    pdh_lbl := label.new(bar_index, pdh, "PDH Target", color = color.new(color.teal, 80), textcolor = color.teal, style = label.style_label_down, size = size.small)
+    pdl_lbl := label.new(bar_index, pdl, "PDL Target", color = color.new(color.maroon, 80), textcolor = color.maroon, style = label.style_label_up, size = size.small)
+
+// -------------------------------------------------------------------------
+// STATE
+// -------------------------------------------------------------------------
+run = is_5m and barstate.isconfirmed
+
+atr        = ta.atr(14)
+swing_low  = ta.lowest(low, swing_len)[1]
+swing_high = ta.highest(high, swing_len)[1]
+
+var bool  swept_low      = false
+var bool  swept_high     = false
+var float sweep_low_val  = na
+var float sweep_high_val = na
+
+var float bull_fvg_top = na
+var float bull_fvg_bot = na
+var float bear_fvg_top = na
+var float bear_fvg_bot = na
+var int   bull_fvg_bar = na
+var int   bear_fvg_bar = na
+
+var bool waiting_for_bull_retest = false
+var bool waiting_for_bear_retest = false
+
+var int trades_today = 0
+
+var int   active_dir   = 0     // 1 for Long, -1 for Short, 0 for None
+var float active_entry = na
+var float active_sl    = na
+var float active_tp    = na
+
+var line  line_active_tp = na
+var line  line_active_sl = na
+var label lbl_active_tp  = na
+var label lbl_active_sl  = na
+
+var int   total_signals = 0
+var int   wins          = 0
+var int   losses        = 0
+var float net_r         = 0.0
+var float gross_win_r   = 0.0
+var float gross_loss_r  = 0.0
+
+// Reset all setup state outside the session and at the start of each new day.
+// The new-day check matters on RTH-only charts, where every bar is in session.
+if not in_ny_session or is_new_day
+    swept_low      := false
+    swept_high     := false
+    sweep_low_val  := na
+    sweep_high_val := na
+    waiting_for_bull_retest := false
+    waiting_for_bear_retest := false
+
+if is_new_day
+    trades_today := 0
+
+// -------------------------------------------------------------------------
+// ACTIVE TRADE MANAGEMENT
+// Runs before new signals, so a trade is never resolved on its own entry bar
+// and a new trade may start on the bar where the previous one exits.
+// Fill rules match TradingView's Strategy Tester: a bar that opens beyond a
+// level fills at the open; if one bar touches both levels, the path is
+// open -> nearer extreme -> other extreme -> close.
+// -------------------------------------------------------------------------
+float exit_r = na
+
+if run and active_dir != 0
+    if show_trade_lines
+        if not na(line_active_tp)
+            line.set_x2(line_active_tp, bar_index)
+            label.set_x(lbl_active_tp, bar_index)
+        if not na(line_active_sl)
+            line.set_x2(line_active_sl, bar_index)
+            label.set_x(lbl_active_sl, bar_index)
+
+    trade_risk = math.abs(active_entry - active_sl)
+    float exit_px = na
+
+    high_first = (high - open) < (open - low)
+
+    if active_dir == 1
+        hit_sl = low <= active_sl
+        hit_tp = high >= active_tp
+        if open <= active_sl or open >= active_tp
+            exit_px := open
+        else if hit_sl and hit_tp
+            exit_px := high_first ? active_tp : active_sl
+        else if hit_sl
+            exit_px := active_sl
+        else if hit_tp
+            exit_px := active_tp
+    else
+        hit_sl = high >= active_sl
+        hit_tp = low <= active_tp
+        if open >= active_sl or open <= active_tp
+            exit_px := open
+        else if hit_sl and hit_tp
+            exit_px := high_first ? active_sl : active_tp
+        else if hit_sl
+            exit_px := active_sl
+        else if hit_tp
+            exit_px := active_tp
+
+    if na(exit_px) and close_eod and (last_sess_bar or not in_ny_session or is_new_day)
+        exit_px := close
+
+    if not na(exit_px)
+        trade_cost = cost_ticks * syminfo.mintick + cost_pct / 100 * (active_entry + exit_px)
+        exit_r    := (active_dir * (exit_px - active_entry) - trade_cost) / trade_risk
+        net_r  += exit_r
+        if exit_r > 0
+            wins        += 1
+            gross_win_r += exit_r
+        else
+            losses       += 1
+            gross_loss_r -= exit_r
+
+        if show_trade_lines
+            label.new(bar_index, exit_px, (exit_r > 0 ? "+" : "") + str.tostring(exit_r, "0.00") + "R", color = exit_r > 0 ? color.green : color.red, textcolor = color.white, style = label.style_label_left, size = size.tiny)
+
+        active_dir := 0
+
+// -------------------------------------------------------------------------
+// 5-MINUTE EXECUTION ENGINE: SWEEP + FVG + RETEST
+// -------------------------------------------------------------------------
+if run and in_ny_session
+    // Invalidate first: a break of the sweep extreme, or an unfilled FVG that has
+    // gone stale, kills the setup. Running this before sweep detection lets the
+    // bar that broke the old extreme register as a fresh (deeper) sweep.
+    if waiting_for_bull_retest and (low < sweep_low_val or (fvg_expiry > 0 and bar_index - bull_fvg_bar > fvg_expiry))
+        waiting_for_bull_retest := false
+        swept_low               := false
+
+    if waiting_for_bear_retest and (high > sweep_high_val or (fvg_expiry > 0 and bar_index - bear_fvg_bar > fvg_expiry))
+        waiting_for_bear_retest := false
+        swept_high              := false
+
+    if allow_long and not swept_low and low < swing_low
+        swept_low     := true
+        sweep_low_val := low
+
+    if allow_short and not swept_high and high > swing_high
+        swept_high     := true
+        sweep_high_val := high
+
+    // Track the sweep extreme only until the FVG forms; after that it is the
+    // fixed invalidation / stop level.
+    if swept_low and not waiting_for_bull_retest and low < sweep_low_val
+        sweep_low_val := low
+    if swept_high and not waiting_for_bear_retest and high > sweep_high_val
+        sweep_high_val := high
+
+// -------------------------------------------------------------------------
+// FAIR VALUE GAP (FVG) DETECTION
+// -------------------------------------------------------------------------
+bull_gap    = low - high[2]
+bear_gap    = low[2] - high
+is_bull_fvg = bull_gap > 0 and close[1] > open[1] and bull_gap >= min_fvg_atr * atr
+is_bear_fvg = bear_gap > 0 and close[1] < open[1] and bear_gap >= min_fvg_atr * atr
+
+box_len = fvg_expiry > 0 ? fvg_expiry : 12
+
+if run and in_ny_session
+    if swept_low and is_bull_fvg and not waiting_for_bull_retest
+        bull_fvg_top := low
+        bull_fvg_bot := high[2]
+        bull_fvg_bar := bar_index
+        waiting_for_bull_retest := true
+
+        if show_fvg_boxes
+            box.new(left = bar_index - 2, top = bull_fvg_top, right = bar_index + box_len, bottom = bull_fvg_bot, border_color = color.green, bgcolor = color.new(color.green, 85), text = "FVG", text_color = color.green, text_size = size.small)
+
+    if swept_high and is_bear_fvg and not waiting_for_bear_retest
+        bear_fvg_top := low[2]
+        bear_fvg_bot := high
+        bear_fvg_bar := bar_index
+        waiting_for_bear_retest := true
+
+        if show_fvg_boxes
+            box.new(left = bar_index - 2, top = bear_fvg_top, right = bar_index + box_len, bottom = bear_fvg_bot, border_color = color.red, bgcolor = color.new(color.red, 85), text = "FVG", text_color = color.red, text_size = size.small)
+
+// -------------------------------------------------------------------------
+// RETEST ENTRY TRIGGER (ONLY ON 5M)
+// -------------------------------------------------------------------------
+bull_entry_signal = false
+bear_entry_signal = false
+float sig_sl = na
+float sig_tp = na
+
+can_enter = in_entry_win and not last_sess_bar and active_dir == 0 and trades_today < max_trades
+
+if run and in_ny_session
+    // The retest must come after the FVG candle (which always touches its own gap).
+    // A retest consumes the setup whether or not it passes the trade filters.
+    if waiting_for_bull_retest and bar_index > bull_fvg_bar and low <= bull_fvg_top and high >= bull_fvg_bot
+        waiting_for_bull_retest := false
+        swept_low               := false
+
+        // Stop at least 1 tick beyond the sweep extreme; prices kept on the tick grid
+        long_sl   = math.round_to_mintick(sweep_low_val - math.max(stop_buf_atr * atr, syminfo.mintick))
+        long_risk = close - long_sl
+        long_tp   = target_mode == "PDH / PDL" ? pdh : math.round_to_mintick(close + fixed_rr * long_risk)
+        long_rr   = target_mode == "Fixed R" ? fixed_rr : (long_tp - close) / long_risk
+        long_ok   = not na(long_sl) and not na(long_tp) and long_risk > 0 and long_tp > close and long_rr >= min_rr and (not need_hold or close >= bull_fvg_bot)
+
+        if can_enter and long_ok
+            bull_entry_signal := true
+            sig_sl            := long_sl
+            sig_tp            := long_tp
+
+    if waiting_for_bear_retest and bar_index > bear_fvg_bar and high >= bear_fvg_bot and low <= bear_fvg_top
+        waiting_for_bear_retest := false
+        swept_high              := false
+
+        short_sl   = math.round_to_mintick(sweep_high_val + math.max(stop_buf_atr * atr, syminfo.mintick))
+        short_risk = short_sl - close
+        short_tp   = target_mode == "PDH / PDL" ? pdl : math.round_to_mintick(close - fixed_rr * short_risk)
+        short_rr   = target_mode == "Fixed R" ? fixed_rr : (close - short_tp) / short_risk
+        short_ok   = not na(short_sl) and not na(short_tp) and short_risk > 0 and short_tp < close and short_rr >= min_rr and (not need_hold or close <= bear_fvg_top)
+
+        if can_enter and short_ok and not bull_entry_signal
+            bear_entry_signal := true
+            sig_sl            := short_sl
+            sig_tp            := short_tp
+
+// -------------------------------------------------------------------------
+// START TRADE TRACKING
+// -------------------------------------------------------------------------
+if bull_entry_signal or bear_entry_signal
+    active_dir    := bull_entry_signal ? 1 : -1
+    active_entry  := close
+    active_sl     := sig_sl
+    active_tp     := sig_tp
+    total_signals += 1
+    trades_today  += 1
+
+    if show_trade_lines
+        line_active_tp := line.new(bar_index, active_tp, bar_index + 1, active_tp, color = color.green, width = 2)
+        line_active_sl := line.new(bar_index, active_sl, bar_index + 1, active_sl, color = color.red, width = 2)
+        lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, format.mintick), color = color.green, textcolor = color.white, style = active_dir == 1 ? label.style_label_lower_right : label.style_label_upper_right, size = size.small)
+        lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, format.mintick), color = color.red, textcolor = color.white, style = active_dir == 1 ? label.style_label_upper_right : label.style_label_lower_right, size = size.small)
+
+// -------------------------------------------------------------------------
+// PLOT SIGNALS (5M ONLY)
+// -------------------------------------------------------------------------
+plotshape(bull_entry_signal, title = "Buy Signal", location = location.belowbar, color = color.green, style = shape.triangleup, size = size.normal, text = "BUY")
+plotshape(bear_entry_signal, title = "Sell Signal", location = location.abovebar, color = color.red, style = shape.triangledown, size = size.normal, text = "SELL")
+
+// -------------------------------------------------------------------------
+// ON-CHART DASHBOARD TABLE
+// -------------------------------------------------------------------------
+var table info_table = na
+
+table_pos = switch tbl_position
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+if is_5m and show_stats_tbl and barstate.islast
+    info_table := table.new(table_pos, 2, 12, bgcolor = color.new(color.black, 20), border_color = color.gray, border_width = 1)
+
+    resolved   = wins + losses
+    win_rate   = resolved > 0 ? wins * 100.0 / resolved : 0.0
+    expectancy = resolved > 0 ? net_r / resolved : 0.0
+    pf_text    = gross_loss_r > 0 ? str.tostring(gross_win_r / gross_loss_r, "0.00") : "-"
+    bias_text  = daily_bullish ? "BULLISH" : daily_bearish ? "BEARISH" : "NEUTRAL"
+    bias_color = daily_bullish ? color.green : daily_bearish ? color.red : color.gray
+    pnl_color  = net_r >= 0 ? color.green : color.red
+
+    // Strategy Metrics Header
+    table.cell(info_table, 0, 0, "Daily Sweep & FVG", bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 0, "5M Stats",          bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 1, "Daily Bias", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 1, bias_text,    text_color = bias_color,  text_size = size.small)
+
+    table.cell(info_table, 0, 2, "Trades", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 2, str.tostring(total_signals), text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 3, "Wins / Losses", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 3, str.tostring(wins) + " / " + str.tostring(losses), text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 4, "Win Rate", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 4, str.tostring(win_rate, "0.0") + "%", text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 5, "Net Result", bgcolor = color.new(color.navy, 30), text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 5, (net_r > 0 ? "+" : "") + str.tostring(net_r, "0.00") + " R", bgcolor = color.new(color.navy, 30), text_color = pnl_color, text_size = size.small)
+
+    table.cell(info_table, 0, 6, "Expectancy", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 6, str.tostring(expectancy, "0.00") + " R / trade", text_color = pnl_color, text_size = size.small)
+
+    table.cell(info_table, 0, 7, "Profit Factor", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 7, pf_text, text_color = color.white, text_size = size.small)
+
+    // Active Signal Status & Exact Price Levels
+    status_text  = active_dir == 1 ? "LONG ACTIVE" : active_dir == -1 ? "SHORT ACTIVE" : "WAITING SETUP"
+    status_color = active_dir == 1 ? color.green : active_dir == -1 ? color.maroon : color.gray
+
+    table.cell(info_table, 0, 8, "Trade Status", bgcolor = status_color, text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 8, status_text,    bgcolor = status_color, text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 9, "Entry", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 9, active_dir != 0 ? str.tostring(active_entry, format.mintick) : "-", text_color = color.white, text_size = size.small)
+
+    table.cell(info_table, 0, 10, "Active Target (TP)", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 10, active_dir != 0 ? str.tostring(active_tp, format.mintick) : "-", text_color = color.green, text_size = size.small)
+
+    table.cell(info_table, 0, 11, "Active Stop (SL)", text_color = color.white, text_size = size.small)
+    table.cell(info_table, 1, 11, active_dir != 0 ? str.tostring(active_sl, format.mintick) : "-", text_color = color.red, text_size = size.small)
+
+// -------------------------------------------------------------------------
+// ALERTS
+// Static alerts (pick them in the alert dialog), plus a dynamic alert with the
+// exact entry/stop/target (choose "Any alert() function call").
+// -------------------------------------------------------------------------
+alertcondition(bull_entry_signal, title = "Daily Sweep: Long Entry", message = "Daily Sweep Bullish Entry: 5M FVG retest confirmed.")
+alertcondition(bear_entry_signal, title = "Daily Sweep: Short Entry", message = "Daily Sweep Bearish Entry: 5M FVG retest confirmed.")
+
+if bull_entry_signal or bear_entry_signal
+    alert((bull_entry_signal ? "LONG " : "SHORT ") + syminfo.ticker + " | Entry " + str.tostring(close, format.mintick) + " | SL " + str.tostring(sig_sl, format.mintick) + " | TP " + str.tostring(sig_tp, format.mintick), alert.freq_once_per_bar_close)
