@@ -1,5 +1,5 @@
 //@version=6
-indicator("Daily Sweep & FVG Strategy [5M/1H/4H]", shorttitle = "Sweep+FVG", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+strategy("Daily Sweep & FVG Strategy [Backtest]", shorttitle = "Sweep+FVG BT", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.percent, commission_value = 0.01, slippage = 1, process_orders_on_close = true, pyramiding = 0, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
 
 // =========================================================================
 // SYSTEM
@@ -7,6 +7,11 @@ indicator("Daily Sweep & FVG Strategy [5M/1H/4H]", shorttitle = "Sweep+FVG", ove
 // -> displacement FVG -> first retest of the FVG = entry.
 // Stop beyond the sweep extreme, target PDH (long) / PDL (short) or fixed R.
 // Signals and stats are evaluated on closed bars only (no repainting).
+//
+// BACKTEST VERSION: same signal logic as daily_sweep_fvg.pine, plus orders for
+// the Strategy Tester. Entries fill at the signal bar's close; stop/target are
+// working orders from the next bar. Set commission/slippage in Properties to
+// match your broker before trusting the results.
 // =========================================================================
 
 // -------------------------------------------------------------------------
@@ -40,6 +45,24 @@ show_trade_lines = input.bool(true, "Track Active Signal TP & SL Lines", group =
 show_stats_tbl   = input.bool(true, "Show Performance Dashboard", group = grp_display)
 tbl_position     = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = grp_display)
 
+grp_size    = "Position Sizing"
+sizing_mode = input.string("Risk % of Equity", "Sizing", options = ["Risk % of Equity", "Fixed Quantity"], group = grp_size)
+risk_pct    = input.float(1.0, "Risk per Trade (%)", minval = 0.1, step = 0.1, group = grp_size, tooltip = "Equity lost if the stop is hit. Used when Sizing = Risk % of Equity.")
+max_lev     = input.float(1.0, "Max Leverage (0 = no cap)", minval = 0.0, step = 0.5, group = grp_size, tooltip = "Caps position value at this multiple of equity. Set 0 for futures, where margin rather than notional limits size.")
+fixed_qty   = input.float(1.0, "Fixed Quantity", minval = 0.0, group = grp_size, tooltip = "Shares / contracts / units per trade when Sizing = Fixed Quantity.")
+
+// Position size so that a stop-out loses risk_pct of equity (whole units except crypto)
+calc_qty(entry_px, stop_px) =>
+    float q = 0.0
+    if sizing_mode == "Fixed Quantity"
+        q := fixed_qty
+    else
+        per_unit = math.abs(entry_px - stop_px) * syminfo.pointvalue
+        q := per_unit > 0 ? strategy.equity * risk_pct / 100 / per_unit : 0.0
+        if max_lev > 0
+            q := math.min(q, strategy.equity * max_lev / (entry_px * syminfo.pointvalue))
+    syminfo.type == "crypto" ? q : math.floor(q)
+
 // -------------------------------------------------------------------------
 // TIMEFRAME VALIDATION
 // -------------------------------------------------------------------------
@@ -49,7 +72,7 @@ is_4h  = timeframe.isminutes and timeframe.multiplier == 240
 is_allowed_tf = is_5m or is_1h or is_4h
 
 if not is_allowed_tf
-    runtime.error("This indicator is designed for 5m, 1h, and 4h timeframes only.")
+    runtime.error("This strategy is designed for 5m, 1h, and 4h timeframes only.")
 
 // -------------------------------------------------------------------------
 // DAILY BIAS & LEVELS (HIGHER TIMEFRAME ORDER FLOW)
@@ -321,6 +344,22 @@ if bull_entry_signal or bear_entry_signal
         lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, format.mintick), color = color.red, textcolor = color.white, style = active_dir == 1 ? label.style_label_upper_right : label.style_label_lower_right, size = size.small)
 
 // -------------------------------------------------------------------------
+// ORDERS
+// -------------------------------------------------------------------------
+if bull_entry_signal or bear_entry_signal
+    qty = calc_qty(close, sig_sl)
+    if qty > 0
+        if bull_entry_signal
+            strategy.entry("Long", strategy.long, qty = qty)
+            strategy.exit("Long Exit", from_entry = "Long", stop = sig_sl, limit = sig_tp)
+        else
+            strategy.entry("Short", strategy.short, qty = qty)
+            strategy.exit("Short Exit", from_entry = "Short", stop = sig_sl, limit = sig_tp)
+
+if run and close_eod and strategy.position_size != 0 and (last_sess_bar or not in_ny_session or is_new_day)
+    strategy.close_all(comment = "Session End")
+
+// -------------------------------------------------------------------------
 // PLOT SIGNALS (5M ONLY)
 // -------------------------------------------------------------------------
 plotshape(bull_entry_signal, title = "Buy Signal", location = location.belowbar, color = color.green, style = shape.triangleup, size = size.normal, text = "BUY")
@@ -391,12 +430,8 @@ if is_5m and show_stats_tbl and barstate.islast
     table.cell(info_table, 1, 11, active_dir != 0 ? str.tostring(active_sl, format.mintick) : "-", text_color = color.red, text_size = size.small)
 
 // -------------------------------------------------------------------------
-// ALERTS
-// Static alerts (pick them in the alert dialog), plus a dynamic alert with the
-// exact entry/stop/target (choose "Any alert() function call").
+// ALERTS (choose "alert() function calls only" in the alert dialog)
 // -------------------------------------------------------------------------
-alertcondition(bull_entry_signal, title = "Daily Sweep: Long Entry", message = "Daily Sweep Bullish Entry: 5M FVG retest confirmed.")
-alertcondition(bear_entry_signal, title = "Daily Sweep: Short Entry", message = "Daily Sweep Bearish Entry: 5M FVG retest confirmed.")
 
 if bull_entry_signal or bear_entry_signal
     alert((bull_entry_signal ? "LONG " : "SHORT ") + syminfo.ticker + " | Entry " + str.tostring(close, format.mintick) + " | SL " + str.tostring(sig_sl, format.mintick) + " | TP " + str.tostring(sig_tp, format.mintick), alert.freq_once_per_bar_close)
