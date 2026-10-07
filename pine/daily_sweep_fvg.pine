@@ -79,11 +79,25 @@ var bool  swept_high      = false
 var float sweep_low_val  = na
 var float sweep_high_val = na
 
-if not in_ny_session
+var float bull_fvg_top = na
+var float bull_fvg_bot = na
+var float bear_fvg_top = na
+var float bear_fvg_bot = na
+var int   bull_fvg_bar = na
+var int   bear_fvg_bar = na
+
+var bool waiting_for_bull_retest = false
+var bool waiting_for_bear_retest = false
+
+// Reset all setup state outside the session and at the start of each new day.
+// The new-day check matters on RTH-only charts, where every bar is in session.
+if not in_ny_session or is_new_day
     swept_low      := false
     swept_high     := false
     sweep_low_val  := na
     sweep_high_val := na
+    waiting_for_bull_retest := false
+    waiting_for_bear_retest := false
 
 if is_5m and in_ny_session
     if daily_bullish and not swept_low and (low < swing_low)
@@ -94,9 +108,11 @@ if is_5m and in_ny_session
         swept_high     := true
         sweep_high_val := high
 
-    if swept_low and low < sweep_low_val
+    // Track the sweep extreme only until the FVG forms; after that it is the
+    // fixed invalidation / stop level.
+    if swept_low and not waiting_for_bull_retest and low < sweep_low_val
         sweep_low_val := low
-    if swept_high and high > sweep_high_val
+    if swept_high and not waiting_for_bear_retest and high > sweep_high_val
         sweep_high_val := high
 
 // -------------------------------------------------------------------------
@@ -105,20 +121,13 @@ if is_5m and in_ny_session
 is_bull_fvg = is_5m and (low > high[2]) and (close[1] > open[1])
 is_bear_fvg = is_5m and (high < low[2]) and (close[1] < open[1])
 
-var float bull_fvg_top = na
-var float bull_fvg_bot = na
-var float bear_fvg_top = na
-var float bear_fvg_bot = na
-
-var bool waiting_for_bull_retest = false
-var bool waiting_for_bear_retest = false
-
 if is_5m and in_ny_session
     if swept_low and is_bull_fvg and not waiting_for_bull_retest
         bull_fvg_top := low
         bull_fvg_bot := high[2]
+        bull_fvg_bar := bar_index
         waiting_for_bull_retest := true
-        
+
         if show_fvg_boxes
             box.new(left = bar_index - 2, top = bull_fvg_top, right = bar_index + 12, bottom = bull_fvg_bot, 
                     border_color = color.green, bgcolor = color.new(color.green, 85), 
@@ -127,6 +136,7 @@ if is_5m and in_ny_session
     if swept_high and is_bear_fvg and not waiting_for_bear_retest
         bear_fvg_top := low[2]
         bear_fvg_bot := high
+        bear_fvg_bar := bar_index
         waiting_for_bear_retest := true
         
         if show_fvg_boxes
@@ -141,25 +151,28 @@ bull_entry_signal = false
 bear_entry_signal = false
 
 if is_5m and in_ny_session
-    if waiting_for_bull_retest and not na(bull_fvg_top)
+    // Invalidate first: a break of the sweep extreme kills the setup
+    if waiting_for_bull_retest and low < sweep_low_val
+        waiting_for_bull_retest := false
+        swept_low               := false
+
+    if waiting_for_bear_retest and high > sweep_high_val
+        waiting_for_bear_retest := false
+        swept_high              := false
+
+    // The retest must come after the FVG candle (which always touches its own gap),
+    // and the PDH/PDL target must still be ahead of price
+    if waiting_for_bull_retest and bar_index > bull_fvg_bar
         if low <= bull_fvg_top and high >= bull_fvg_bot
-            bull_entry_signal       := true
+            bull_entry_signal       := close < pdh
             waiting_for_bull_retest := false
             swept_low               := false
 
-    if waiting_for_bear_retest and not na(bear_fvg_top)
+    if waiting_for_bear_retest and bar_index > bear_fvg_bar
         if high >= bear_fvg_bot and low <= bear_fvg_top
-            bear_entry_signal       := true
+            bear_entry_signal       := close > pdl
             waiting_for_bear_retest := false
             swept_high              := false
-
-if waiting_for_bull_retest and low < sweep_low_val
-    waiting_for_bull_retest := false
-    swept_low               := false
-
-if waiting_for_bear_retest and high > sweep_high_val
-    waiting_for_bear_retest := false
-    swept_high              := false
 
 // -------------------------------------------------------------------------
 // PLOT SIGNALS (5M ONLY)
@@ -185,6 +198,37 @@ var label lbl_active_tp  = na
 var label lbl_active_sl  = na
 
 if is_5m
+    // Extend lines and labels while trade is active
+    if active_dir != 0 and show_trade_lines
+        if not na(line_active_tp)
+            line.set_x2(line_active_tp, bar_index)
+            label.set_x(lbl_active_tp, bar_index)
+        if not na(line_active_sl)
+            line.set_x2(line_active_sl, bar_index)
+            label.set_x(lbl_active_sl, bar_index)
+
+    // Exits are checked before entries so a trade is never resolved on its own entry
+    // bar (that bar's high/low printed before the close we entered at). When one bar
+    // touches both levels, the stop is assumed to have been hit first.
+
+    // Check Long Exit Conditions
+    if active_dir == 1
+        if low <= active_sl
+            losses     += 1
+            active_dir := 0
+        else if high >= active_tp
+            wins       += 1
+            active_dir := 0
+
+    // Check Short Exit Conditions
+    if active_dir == -1
+        if high >= active_sl
+            losses     += 1
+            active_dir := 0
+        else if low <= active_tp
+            wins       += 1
+            active_dir := 0
+
     // Start Long Trade Tracking
     if bull_entry_signal and active_dir == 0
         active_dir    := 1
@@ -196,8 +240,8 @@ if is_5m
         if show_trade_lines
             line_active_tp := line.new(bar_index, active_tp, bar_index + 1, active_tp, color = color.green, width = 2)
             line_active_sl := line.new(bar_index, active_sl, bar_index + 1, active_sl, color = color.red, width = 2)
-            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
-            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
+            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, format.mintick), color = color.green, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
+            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, format.mintick), color = color.red, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
 
     // Start Short Trade Tracking
     if bear_entry_signal and active_dir == 0
@@ -210,35 +254,8 @@ if is_5m
         if show_trade_lines
             line_active_tp := line.new(bar_index, active_tp, bar_index + 1, active_tp, color = color.green, width = 2)
             line_active_sl := line.new(bar_index, active_sl, bar_index + 1, active_sl, color = color.red, width = 2)
-            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, "#.##"), color = color.green, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
-            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, "#.##"), color = color.red, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
-
-    // Extend lines and labels while trade is active
-    if active_dir != 0 and show_trade_lines
-        if not na(line_active_tp)
-            line.set_x2(line_active_tp, bar_index)
-            label.set_x(lbl_active_tp, bar_index)
-        if not na(line_active_sl)
-            line.set_x2(line_active_sl, bar_index)
-            label.set_x(lbl_active_sl, bar_index)
-
-    // Check Long Exit Conditions
-    if active_dir == 1
-        if high >= active_tp
-            wins       += 1
-            active_dir := 0
-        else if low <= active_sl
-            losses     += 1
-            active_dir := 0
-
-    // Check Short Exit Conditions
-    if active_dir == -1
-        if low <= active_tp
-            wins       += 1
-            active_dir := 0
-        else if high >= active_sl
-            losses     += 1
-            active_dir := 0
+            lbl_active_tp  := label.new(bar_index, active_tp, "TP: " + str.tostring(active_tp, format.mintick), color = color.green, textcolor = color.white, style = label.style_label_upper_right, size = size.small)
+            lbl_active_sl  := label.new(bar_index, active_sl, "SL: " + str.tostring(active_sl, format.mintick), color = color.red, textcolor = color.white, style = label.style_label_lower_right, size = size.small)
 
 // Calculate win rate
 resolved_trades = wins + losses
@@ -284,10 +301,10 @@ if is_5m and show_stats_tbl and barstate.islast
     table.cell(info_table, 1, 5, status_text,    bgcolor = status_color, text_color = color.white, text_size = size.small)
 
     table.cell(info_table, 0, 6, "Active Target (TP)", text_color = color.white, text_size = size.small)
-    table.cell(info_table, 1, 6, active_dir != 0 ? str.tostring(active_tp, "#.##") : "-", text_color = color.green, text_size = size.small)
+    table.cell(info_table, 1, 6, active_dir != 0 ? str.tostring(active_tp, format.mintick) : "-", text_color = color.green, text_size = size.small)
 
     table.cell(info_table, 0, 7, "Active Stop (SL)", text_color = color.white, text_size = size.small)
-    table.cell(info_table, 1, 7, active_dir != 0 ? str.tostring(active_sl, "#.##") : "-", text_color = color.red, text_size = size.small)
+    table.cell(info_table, 1, 7, active_dir != 0 ? str.tostring(active_sl, format.mintick) : "-", text_color = color.red, text_size = size.small)
 
 // -------------------------------------------------------------------------
 // ALERTS
