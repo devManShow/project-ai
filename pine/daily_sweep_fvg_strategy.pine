@@ -105,14 +105,14 @@ is_new_day    = timeframe.change("D")
 in_ny_session = not na(time(timeframe.period, ny_session, ny_tz))
 in_entry_win  = not na(time(timeframe.period, entry_window, ny_tz))
 
-// Last bar of the session: its close time reaches the session end (HHMM after the '-').
-// Sessions that end at/after midnight fall back to the symbol's regular-session close.
-sess_start_m  = int(str.tonumber(str.substring(ny_session, 0, 2))) * 60 + int(str.tonumber(str.substring(ny_session, 2, 4)))
-sess_end_h    = int(str.tonumber(str.substring(ny_session, 5, 7)))
-sess_end_m    = int(str.tonumber(str.substring(ny_session, 7, 9)))
-sess_wraps    = sess_end_h * 60 + sess_end_m <= sess_start_m
-sess_end_ts   = timestamp(ny_tz, year(time, ny_tz), month(time, ny_tz), dayofmonth(time, ny_tz), sess_end_h, sess_end_m)
-last_sess_bar = in_ny_session and ((not sess_wraps and not na(sess_end_ts) and time_close >= sess_end_ts) or session.islastbar_regular)
+// Last bar of the session: the bar whose open->close spans the session end time of
+// day (midnight-safe, so overnight and "-0000" sessions work), or the symbol's
+// regular-session close (early-close days).
+sess_end_tod  = int(str.tonumber(str.substring(ny_session, 5, 7))) * 60 + int(str.tonumber(str.substring(ny_session, 7, 9)))
+bar_open_tod  = hour(time, ny_tz) * 60 + minute(time, ny_tz)
+bar_close_tod = hour(time_close, ny_tz) * 60 + minute(time_close, ny_tz)
+spans_end     = bar_open_tod < bar_close_tod ? (bar_open_tod < sess_end_tod and bar_close_tod >= sess_end_tod) : (bar_open_tod < sess_end_tod or bar_close_tod >= sess_end_tod)
+last_sess_bar = in_ny_session and (spans_end or session.islastbar_regular)
 
 // -------------------------------------------------------------------------
 // PREVIOUS DAY LEVELS (PDH / PDL) & DAILY BIAS BACKGROUND
@@ -359,13 +359,15 @@ if run and in_ny_session
 
 // -------------------------------------------------------------------------
 // ORDERS
-// Sized first: a signal the account cannot size is dropped, so the tracked
-// trade, dashboard, markers, alerts and Strategy Tester see the same trades.
+// Sized first: a signal the account cannot size, or that arrives while the
+// Strategy Tester still holds a position (e.g. with "Verify price for limit
+// orders" on), is dropped, so the tracked trade, dashboard, markers, alerts
+// and Strategy Tester see the same trades.
 // -------------------------------------------------------------------------
 float sig_qty = na
 if bull_entry_signal or bear_entry_signal
     sig_qty := calc_qty(close, sig_sl)
-    if not (sig_qty > 0)
+    if not (sig_qty > 0) or strategy.position_size != 0
         bull_entry_signal := false
         bear_entry_signal := false
 
